@@ -16,6 +16,9 @@ use tempfile::TempDir;
 mod config;
 pub use config::BootstrapConfig;
 
+/// Enclave-side bootstrap over vsock.
+#[cfg(all(target_os = "linux", feature = "enclave"))]
+pub mod enclave;
 /// Host-side bundle preparation and provisioning.
 #[cfg(feature = "host")]
 pub mod host;
@@ -76,6 +79,12 @@ pub enum Error {
     /// A declared bundle must end exactly at its declared executable.
     #[error("trailing data after worker bundle")]
     TrailingData,
+    /// The bootstrap connection did not come from the parent instance.
+    #[error("worker provisioner must be the parent host")]
+    NotParent,
+    /// Staging is not a root-owned directory on a writable, executable mount.
+    #[error("worker staging requires a root-owned directory on a writable, executable mount")]
+    UnusableStaging,
 }
 
 impl Manifest {

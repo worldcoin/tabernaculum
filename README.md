@@ -6,6 +6,6 @@ A closed worker executable reaches the enclave once at boot, is verified, and ru
 
 | Crate | Purpose |
 |---|---|
-| `tabernaculum-bundle` | Bundle format, enclave-side receive and verification, host-side provisioning over vsock (`host` feature) |
+| `tabernaculum-bundle` | Bundle format and verification; enclave-side bootstrap (`enclave` feature) and host-side provisioning (`host` feature) over vsock |
 
 Consumers pin a git tag until the API settles.
