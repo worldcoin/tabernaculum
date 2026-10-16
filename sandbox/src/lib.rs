@@ -7,11 +7,13 @@
 #![deny(clippy::all, missing_docs)]
 
 mod connection;
+mod policy;
 #[cfg(target_os = "linux")]
 mod process;
 mod transport;
 
 pub use connection::{ConnectionConfig, ConnectionError};
+pub use policy::{Policy, PolicyError};
 #[cfg(target_os = "linux")]
 pub use process::{SandboxConfig, WORKER_UID, Worker, WorkerError};
 /// The worker bundle format and enclave-side bootstrap.

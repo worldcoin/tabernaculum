@@ -9,4 +9,10 @@ A closed worker executable reaches the enclave once at boot, is verified, and ru
 | `tabernaculum-bundle` | Bundle format and verification; enclave-side bootstrap (`enclave` feature) and host-side provisioning (`host` feature) over vsock |
 | `tabernaculum` | Minijail jail and seccomp policy, worker lifecycle, framed request/response connection (Linux x86_64) |
 
+Workers start from the reviewed seccomp policy in `sandbox/worker.policy`. An enclave adjusts single entries in code; the launch, IPC and process-creation entries are locked:
+
+```rust
+static POLICY: LazyLock<Policy> = LazyLock::new(|| Policy::default_worker().allow("sched_setaffinity", "1"));
+```
+
 Consumers pin a git tag until the API settles.
