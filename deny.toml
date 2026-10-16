@@ -24,6 +24,20 @@ allow = [
     "Unicode-3.0",
 ]
 
+# Minijail's Rust crates inherit the repository's BSD license but omit Cargo metadata.
+[[licenses.clarify]]
+name = "minijail"
+version = "0.2.3"
+expression = "BSD-3-Clause"
+license-files = [{ path = "../../LICENSE", hash = 0x51549d2b }]
+
+[[licenses.clarify]]
+name = "minijail-sys"
+version = "0.0.14"
+expression = "BSD-3-Clause"
+license-files = [{ path = "../../LICENSE", hash = 0x51549d2b }]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = ["https://github.com/google/minijail"]

@@ -5,8 +5,8 @@
 use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, process::Command, time::Duration};
 
 #[cfg(target_os = "linux")]
-use di_sandbox::{
-    ConnectionConfig, ConnectionError, SandboxConfig, WORKER_UID, Worker, WorkerError,
+use tabernaculum::{
+    ConnectionConfig, ConnectionError, Limits, SandboxConfig, WORKER_UID, Worker, WorkerError,
 };
 
 #[cfg(target_os = "linux")]
@@ -39,8 +39,10 @@ fn config() -> ConnectionConfig {
 fn sandbox(root: &Path) -> SandboxConfig<'_> {
     SandboxConfig {
         root,
-        address_space_bytes: 1 << 30,
-        max_threads: 8,
+        limits: Limits {
+            address_space_bytes: 1 << 30,
+            max_threads: 8,
+        },
     }
 }
 
@@ -160,8 +162,10 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
                     &binary,
                     SandboxConfig {
                         root,
-                        address_space_bytes,
-                        max_threads
+                        limits: Limits {
+                            address_space_bytes,
+                            max_threads
+                        },
                     },
                     config(),
                     fatal
@@ -184,8 +188,8 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
         );
     }
     let verified_runtime = if case == "provisioned-runtime" {
-        use di_sandbox::{Manifest, WORKER_PATH};
         use sha2::{Digest, Sha384};
+        use tabernaculum::bundle::{Manifest, WORKER_PATH};
 
         let bytes = std::fs::read(root.join(WORKER_PATH))?;
         let manifest = serde_json::to_vec(&Manifest {
@@ -195,8 +199,8 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
             size: bytes.len() as u64,
         })?;
         let mut bundle = Vec::new();
-        di_sandbox::package(&mut bundle, &manifest, &root.join(WORKER_PATH))?;
-        Some(di_sandbox::receive(
+        tabernaculum::bundle::package(&mut bundle, &manifest, &root.join(WORKER_PATH))?;
+        Some(tabernaculum::bundle::receive(
             &mut std::io::Cursor::new(bundle),
             1 << 30,
             root.parent().unwrap(),
@@ -398,7 +402,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir(root.join("proc"))?;
     std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))?;
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::copy(peer(), root.join(di_sandbox::WORKER_PATH))?;
+    std::fs::copy(peer(), root.join(tabernaculum::bundle::WORKER_PATH))?;
     std::fs::write(temp.join("broker-secret"), b"must not be visible")?;
 
     for (case, expected_error) in [

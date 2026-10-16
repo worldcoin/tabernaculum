@@ -12,7 +12,7 @@ use std::{
 
 use minijail::Minijail;
 
-use crate::WorkerError;
+use crate::{Limits, WorkerError};
 
 /// Reserved exclusively for the worker inside the enclave, never the broker.
 pub const WORKER_UID: u32 = 65532;
@@ -22,18 +22,16 @@ pub struct SandboxConfig<'a> {
     /// Minimal, root-owned runtime tree containing the verified executable.
     /// Provisioning must keep the entire tree and its ancestors immutable during launch.
     pub root: &'a Path,
-    /// Hard virtual-address-space ceiling; leave physical memory for the broker and kernel.
-    pub address_space_bytes: u64,
-    /// Hard per-UID task ceiling, including the main thread (1..=256).
-    pub max_threads: u32,
+    /// Worker resource limits.
+    pub limits: Limits,
 }
 
 impl SandboxConfig<'_> {
     /// Builds the same fail-closed sandbox for production and adversarial fixtures.
     pub(crate) fn create_jail(&self) -> Result<Minijail, WorkerError> {
-        if self.address_space_bytes == 0
-            || self.address_space_bytes > isize::MAX as u64
-            || !(1..=256).contains(&self.max_threads)
+        if self.limits.address_space_bytes == 0
+            || self.limits.address_space_bytes > isize::MAX as u64
+            || !(1..=256).contains(&self.limits.max_threads)
         {
             return Err(WorkerError::InvalidSandbox("invalid resource limits"));
         }
@@ -92,8 +90,8 @@ impl SandboxConfig<'_> {
         jail.set_supplementary_gids(&[]);
         jail.use_caps(0);
         for (resource, limit) in [
-            (libc::RLIMIT_AS, self.address_space_bytes),
-            (libc::RLIMIT_NPROC, u64::from(self.max_threads)),
+            (libc::RLIMIT_AS, self.limits.address_space_bytes),
+            (libc::RLIMIT_NPROC, u64::from(self.limits.max_threads)),
             (libc::RLIMIT_NOFILE, 64),
             (libc::RLIMIT_CORE, 0),
             (libc::RLIMIT_FSIZE, 0),

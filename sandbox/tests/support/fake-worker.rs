@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "visible host path: {path}"
         );
     }
-    assert!(std::fs::File::open("/bin/verifier-worker").is_ok());
+    assert!(std::fs::File::open("/bin/worker").is_ok());
     assert_eq!(std::env::current_dir()?, std::path::Path::new("/"));
     let mut filesystem = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     assert_eq!(
@@ -196,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             212 => {
                                 libc::openat(
                                     libc::AT_FDCWD,
-                                    c"/bin/verifier-worker".as_ptr(),
+                                    c"/bin/worker".as_ptr(),
                                     libc::O_WRONLY,
                                 );
                             }
@@ -211,12 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 libc::ioctl(3, 0);
                             }
                             215 => {
-                                libc::syscall(
-                                    libc::SYS_execve,
-                                    c"/bin/verifier-worker".as_ptr(),
-                                    0,
-                                    0,
-                                );
+                                libc::syscall(libc::SYS_execve, c"/bin/worker".as_ptr(), 0, 0);
                             }
                             216 => {
                                 libc::mmap(

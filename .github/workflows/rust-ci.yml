@@ -31,6 +31,9 @@ jobs:
           toolchain: 1.98.1
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # tabernaculum builds Minijail from source.
+      - name: Install Minijail build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcap-dev clang pkg-config
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -46,5 +49,18 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install Minijail build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcap-dev clang pkg-config
+      # The sandbox's process tests need root, so they run separately below.
       - name: tests
-        run: cargo test --locked --workspace --all-features
+        run: cargo test --locked --workspace --all-features --exclude tabernaculum
+      - name: Sandbox tests
+        run: cargo test --locked -p tabernaculum
+      - name: Minijail process tests
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" cargo test --locked \
+            --target x86_64-unknown-linux-gnu -p tabernaculum --all-features --no-run \
+            --message-format=json > target/worker-test-artifacts.json
+          test_binary=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "process") | .executable // empty' target/worker-test-artifacts.json)
+          test -n "$test_binary"
+          sudo timeout --kill-after=5s 60s "$test_binary"
