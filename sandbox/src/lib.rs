@@ -15,7 +15,7 @@ mod transport;
 pub use connection::{ConnectionConfig, ConnectionError};
 pub use policy::{Policy, PolicyError};
 #[cfg(target_os = "linux")]
-pub use process::{SandboxConfig, WORKER_UID, Worker, WorkerError};
+pub use process::{SandboxConfig, WORKER_UID, Worker, WorkerError, check_alive_if_idle};
 /// The worker bundle format and enclave-side bootstrap.
 pub use tabernaculum_bundle as bundle;
 

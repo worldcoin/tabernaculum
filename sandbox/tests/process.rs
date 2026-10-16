@@ -325,6 +325,35 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
         let id = if case == "timeout" { 200 } else { 1 };
         assert_eq!(worker.exchange(&request(id))?, request(id));
     }
+    if case == "shared-idle-exit" {
+        let worker = std::sync::Mutex::new(worker);
+        let children_path = format!("/proc/self/task/{}/children", unsafe { libc::getpid() });
+        let pid = std::fs::read_to_string(children_path)?
+            .trim()
+            .parse::<i32>()?;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+
+        // A held lock means a request is in flight; the check must neither block nor exit.
+        let busy = worker.lock().unwrap();
+        tabernaculum::check_alive_if_idle(&worker);
+        drop(busy);
+
+        // A panicked request poisons the lock; liveness must still be checked.
+        let _ = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _request = worker.lock().unwrap();
+                    panic!("request panicked");
+                })
+                .join()
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            tabernaculum::check_alive_if_idle(&worker);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("shared idle worker exit was not terminal");
+    }
     if case == "idle-exit" {
         worker.check_alive();
         let children_path = format!("/proc/self/task/{}/children", unsafe { libc::getpid() });
@@ -422,6 +451,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("worker response violates the protocol"),
         ),
         ("idle-exit", Some("worker socket I/O failed")),
+        ("shared-idle-exit", Some("worker socket I/O failed")),
         ("seccomp", Some("worker socket I/O failed")),
         ("vsock", Some("worker socket I/O failed")),
         ("fork", Some("worker socket I/O failed")),

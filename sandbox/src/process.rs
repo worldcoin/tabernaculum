@@ -151,6 +151,16 @@ impl Worker {
     }
 }
 
+/// Checks liveness unless a request holds the lock; that request's exchange reports a dead
+/// worker itself. A lock poisoned by a panicked request is still checked.
+pub fn check_alive_if_idle(worker: &std::sync::Mutex<Worker>) {
+    match worker.try_lock() {
+        Ok(worker) => worker.check_alive(),
+        Err(std::sync::TryLockError::Poisoned(worker)) => worker.into_inner().check_alive(),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+}
+
 /// Requests namespace termination without waiting; guest teardown owns final cleanup.
 fn kill(pid: libc::pid_t) {
     // SAFETY: This owner never reaps pid. SIGKILL terminates namespace PID 1 and its
