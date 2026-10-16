@@ -185,6 +185,9 @@ pub enum WorkerError {
     /// Minijail could not launch or configure the worker.
     #[error(transparent)]
     Jail(#[from] minijail::Error),
+    /// The seccomp policy has a rejected adjustment.
+    #[error(transparent)]
+    Policy(#[from] crate::PolicyError),
     /// Invalid limits, or the worker failed before its readiness frame.
     #[error(transparent)]
     Connection(#[from] ConnectionError),

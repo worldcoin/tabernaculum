@@ -6,7 +6,8 @@ use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, process::Command, 
 
 #[cfg(target_os = "linux")]
 use tabernaculum::{
-    ConnectionConfig, ConnectionError, Limits, SandboxConfig, WORKER_UID, Worker, WorkerError,
+    ConnectionConfig, ConnectionError, Limits, Policy, SandboxConfig, WORKER_UID, Worker,
+    WorkerError,
 };
 
 #[cfg(target_os = "linux")]
@@ -35,6 +36,9 @@ fn config() -> ConnectionConfig {
 }
 
 #[cfg(target_os = "linux")]
+static POLICY: std::sync::LazyLock<Policy> = std::sync::LazyLock::new(Policy::default_worker);
+
+#[cfg(target_os = "linux")]
 /// Explicit test budgets; production must size these against its enclave memory reservation.
 fn sandbox(root: &Path) -> SandboxConfig<'_> {
     SandboxConfig {
@@ -43,6 +47,7 @@ fn sandbox(root: &Path) -> SandboxConfig<'_> {
             address_space_bytes: 1 << 30,
             max_threads: 8,
         },
+        policy: &POLICY,
     }
 }
 
@@ -166,6 +171,7 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
                             address_space_bytes,
                             max_threads
                         },
+                        policy: &POLICY,
                     },
                     config(),
                     fatal

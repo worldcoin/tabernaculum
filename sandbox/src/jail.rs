@@ -12,7 +12,7 @@ use std::{
 
 use minijail::Minijail;
 
-use crate::{Limits, WorkerError};
+use crate::{Limits, Policy, WorkerError};
 
 /// Reserved exclusively for the worker inside the enclave, never the broker.
 pub const WORKER_UID: u32 = 65532;
@@ -24,6 +24,8 @@ pub struct SandboxConfig<'a> {
     pub root: &'a Path,
     /// Worker resource limits.
     pub limits: Limits,
+    /// Seccomp policy, usually [`Policy::default_worker`] with per-entry adjustments.
+    pub policy: &'a Policy,
 }
 
 impl SandboxConfig<'_> {
@@ -100,7 +102,7 @@ impl SandboxConfig<'_> {
             jail.set_rlimit(resource as i32, limit, limit)?;
         }
 
-        // Embed the policy in the measured public binary; never accept a worker policy path.
+        // The policy is built in the measured binary; never accept a worker policy path.
         // Minijail's Rust parser takes a path, so expose these bytes through a private memfd.
         // SAFETY: The name is NUL-terminated; the returned FD is checked and owned below.
         let fd = unsafe { libc::memfd_create(c"worker-seccomp".as_ptr(), libc::MFD_CLOEXEC) };
@@ -109,7 +111,7 @@ impl SandboxConfig<'_> {
         }
         // SAFETY: memfd_create returned a newly owned descriptor.
         let mut policy = unsafe { File::from_raw_fd(fd) };
-        policy.write_all(include_bytes!("../worker.policy"))?;
+        policy.write_all(self.policy.render()?.as_bytes())?;
         jail.set_seccomp_filter_tsync();
         jail.parse_seccomp_filters(format!("/proc/self/fd/{}", policy.as_raw_fd()))?;
         jail.use_seccomp_filter();
