@@ -242,7 +242,10 @@ async fn connect(cid: u32, deadline: Duration) -> Result<tokio_vsock::VsockStrea
         return Err(Error::InvalidBundle);
     }
 
-    connect_with(deadline, || VsockStream::connect(VsockAddr::new(cid, 1001))).await
+    connect_with(deadline, || {
+        VsockStream::connect(VsockAddr::new(cid, crate::BOOTSTRAP_PORT))
+    })
+    .await
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -261,7 +264,7 @@ where
             match attempt().await {
                 Ok(stream) => {
                     if attempts > 1 {
-                        eprintln!("sandbox bundle bootstrap connected after {attempts} attempts");
+                        tracing::debug!(attempts, "sandbox bundle bootstrap connected");
                     }
                     return Ok(stream);
                 }
@@ -272,10 +275,10 @@ where
                     ) =>
                 {
                     if attempts == 1 {
-                        eprintln!(
-                            "sandbox bundle waiting for bootstrap ({:?}, errno {:?})",
-                            error.kind(),
-                            error.raw_os_error()
+                        tracing::debug!(
+                            kind = ?error.kind(),
+                            errno = ?error.raw_os_error(),
+                            "sandbox bundle waiting for bootstrap"
                         );
                     }
                     tokio::time::sleep(Duration::from_millis(200)).await;

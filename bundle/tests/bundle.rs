@@ -7,10 +7,8 @@ use std::{
     time::Duration,
 };
 
-use flamingo_verifier_sandbox_bundle::{
-    Error, MAX_BUNDLE_BYTES, Manifest, WORKER_PATH, package, receive,
-};
 use sha2::{Digest, Sha384};
+use tabernaculum_bundle::{Error, MAX_BUNDLE_BYTES, Manifest, WORKER_PATH, package, receive};
 
 /// Small executable for verification tests, never executed.
 struct Fixture {
@@ -213,18 +211,17 @@ fn wrong_architecture_and_unknown_fields_are_rejected() {
 }
 
 /// Offline packaging validates actual local bytes and never silently follows artifact symlinks.
+#[cfg(feature = "host")]
 #[tokio::test]
 async fn packaging_matches_the_receiver_and_rejects_changed_files() {
     let fixture = Fixture::new();
     let source = tempfile::tempdir().unwrap();
     let executable = source.path().join("worker");
     fs::write(&executable, &fixture.binary).unwrap();
-    let bundle = flamingo_verifier_sandbox_bundle::host::Bundle::prepare(
-        &fixture.manifest.release_id,
-        &executable,
-    )
-    .await
-    .unwrap();
+    let bundle =
+        tabernaculum_bundle::host::Bundle::prepare(&fixture.manifest.release_id, &executable)
+            .await
+            .unwrap();
     let manifest: Manifest = serde_json::from_slice(&bundle.manifest().unwrap()).unwrap();
     assert_eq!(
         serde_json::to_value(manifest).unwrap(),

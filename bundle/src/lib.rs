@@ -17,10 +17,13 @@ mod config;
 pub use config::BootstrapConfig;
 
 /// Host-side bundle preparation and provisioning.
+#[cfg(feature = "host")]
 pub mod host;
 
 /// The only executable entry point accepted by the public broker.
-pub const WORKER_PATH: &str = "bin/verifier-worker";
+pub const WORKER_PATH: &str = "bin/worker";
+/// vsock port on which the enclave accepts the bundle, once, from the parent.
+pub const BOOTSTRAP_PORT: u32 = 1001;
 /// Maximum declared JSON bytes, before parsing or artifact allocation.
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// Hard format ceiling; the measured boot configuration must choose its own smaller budget.
