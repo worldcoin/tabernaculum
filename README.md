@@ -8,6 +8,7 @@ A closed worker executable reaches the enclave once at boot, is verified, and ru
 |---|---|
 | `tabernaculum-bundle` | Bundle format and verification; enclave-side bootstrap (`enclave` feature) and host-side provisioning (`host` feature) over vsock |
 | `tabernaculum` | Minijail jail and seccomp policy, worker lifecycle, framed request/response connection (Linux x86_64) |
+| `tabernaculum-provisioner` | Host sidecar: fetches the worker bundle from S3, starts the enclave and provisions the worker |
 
 Workers start from the reviewed seccomp policy in `sandbox/worker.policy`. An enclave adjusts single entries in code; the launch, IPC and process-creation entries are locked:
 
@@ -15,4 +16,11 @@ Workers start from the reviewed seccomp policy in `sandbox/worker.policy`. An en
 static POLICY: LazyLock<Policy> = LazyLock::new(|| Policy::default_worker().allow("sched_setaffinity", "1"));
 ```
 
-Consumers pin a git tag until the API settles.
+Deploy repos build their provisioner image on the published base, pinned by digest, and add their EIF:
+
+```dockerfile
+FROM ghcr.io/worldcoin/tabernaculum-provisioner:v0.1.0@sha256:…
+COPY enclave.eif /home/enclave.eif
+```
+
+Each `v*` tag publishes the image; the run summary shows its digest. Consumers pin a git tag until the API settles.
