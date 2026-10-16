@@ -404,6 +404,7 @@ name = "tabernaculum-bundle"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -412,6 +413,7 @@ dependencies = [
  "tokio",
  "tokio-vsock",
  "tracing",
+ "vsock",
 ]
 
 [[package]]
