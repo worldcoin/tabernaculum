@@ -7,6 +7,7 @@ pub struct Config {
     pub ready_file: PathBuf,
     pub artifact_uri: String,
     pub artifact_sha256: String,
+    pub executable_name: String,
     pub debug_mode: bool,
     pub cid: u32,
     pub cpus: u32,
@@ -20,6 +21,15 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let artifact_uri = required("BUNDLE_ARTIFACT_URI")?;
         let artifact_sha256 = required("BUNDLE_ARTIFACT_SHA256")?;
+        let executable_name = setting("BUNDLE_EXECUTABLE", "biometric-engines-worker");
+        ensure!(
+            !executable_name.is_empty()
+                && executable_name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                && !executable_name.starts_with('.'),
+            "BUNDLE_EXECUTABLE must be a plain file name"
+        );
 
         let cid = number("ENCLAVE_CID", 16)?;
         ensure!(cid > 3, "enclave CID must be greater than 3");
@@ -35,6 +45,7 @@ impl Config {
             ready_file: ready_file(),
             artifact_uri,
             artifact_sha256,
+            executable_name,
             debug_mode: setting("ENCLAVE_DEBUG_MODE", "false")
                 .parse()
                 .context("ENCLAVE_DEBUG_MODE must be true or false")?,
@@ -51,7 +62,7 @@ impl Config {
 }
 
 pub fn ready_file() -> PathBuf {
-    setting("BUNDLE_READY_FILE", "/run/di-migration-tee/ready").into()
+    setting("BUNDLE_READY_FILE", "/run/tabernaculum/ready").into()
 }
 
 fn required(name: &str) -> Result<String> {

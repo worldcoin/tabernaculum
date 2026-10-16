@@ -14,6 +14,12 @@ use tokio::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     clear_readiness(&config::ready_file()).await?;
 
     let config = Config::from_env()?;
@@ -37,7 +43,7 @@ async fn main() -> Result<()> {
     // Attempt both cleanup operations, even if either one fails. Preserve the
     // bootstrap/health error in logs if cleanup itself also fails.
     if let Err(error) = &result {
-        eprintln!("enclave-provisioner: {error:#}");
+        tracing::error!(error = format!("{error:#}"), "enclave provisioning failed");
     }
 
     let readiness = clear_readiness(&config.ready_file).await;
@@ -55,13 +61,13 @@ async fn run_enclave(
     directory: &std::path::Path,
 ) -> Result<()> {
     timeout(config.bootstrap_timeout, async {
-        eprintln!("enclave-provisioner: fetching sandbox bundle");
+        tracing::debug!("fetching sandbox bundle");
         let bundle = artifact::fetch(config, directory).await?;
 
-        eprintln!("enclave-provisioner: launching enclave");
+        tracing::debug!("launching enclave");
         enclave.launch().await?;
 
-        eprintln!("enclave-provisioner: provisioning sandbox bundle");
+        tracing::debug!("provisioning sandbox bundle");
         bundle.provision(config.cid, config.io_timeout).await?;
 
         enclave.running().await
@@ -70,7 +76,7 @@ async fn run_enclave(
     .context("provisioner bootstrap deadline exceeded")??;
 
     mark_ready(&config.ready_file).await?;
-    eprintln!("enclave-provisioner: ready");
+    tracing::info!(enclave = %enclave.name, "enclave ready");
 
     enclave.monitor().await
 }

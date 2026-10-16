@@ -2,7 +2,7 @@
 # Linux bootstrap/cleanup tests. AWS and Nitro are mocked.
 # Direct bundle transfer and cancellation are tested in di-sandbox.
 set -euo pipefail
-: "${PROVISIONER_BIN:?set PROVISIONER_BIN to the compiled di-enclave-provisioner}"
+: "${PROVISIONER_BIN:?set PROVISIONER_BIN to the compiled tabernaculum-provisioner}"
 suite=$(mktemp -d)
 provisioner_pid=""
 cleanup() {

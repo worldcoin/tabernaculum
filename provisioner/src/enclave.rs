@@ -31,7 +31,7 @@ impl<'a> Enclave<'a> {
     pub fn new(config: &'a Config, suffix: &str) -> Self {
         Self {
             name: format!(
-                "di-migration-{}-{}",
+                "tabernaculum-{}-{}",
                 std::process::id(),
                 suffix.trim_start_matches('.')
             ),

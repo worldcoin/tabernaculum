@@ -5,7 +5,7 @@ fn mocked_lifecycle() {
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/lifecycle.sh"))
         .env(
             "PROVISIONER_BIN",
-            env!("CARGO_BIN_EXE_di-enclave-provisioner"),
+            env!("CARGO_BIN_EXE_tabernaculum-provisioner"),
         )
         .output()
         .expect("run lifecycle contract tests (requires bash, jq, tar, sha256sum)");

@@ -1,8 +1,8 @@
 use crate::{config::Config, process};
 use anyhow::{Context, Result, ensure};
-use di_sandbox::host::Bundle;
 use sha2::{Digest, Sha256};
 use std::{ffi::OsStr, path::Path, time::Duration};
+use tabernaculum_bundle::host::Bundle;
 use tokio::io::AsyncReadExt;
 
 pub async fn fetch(config: &Config, directory: &Path) -> Result<Bundle> {
@@ -11,7 +11,7 @@ pub async fn fetch(config: &Config, directory: &Path) -> Result<Bundle> {
     let digest = verify(&archive, &config.artifact_sha256).await?;
 
     let executable = directory.join("executable");
-    extract(&archive, &executable).await?;
+    extract(&archive, &executable, &config.executable_name).await?;
     inspect(&executable).await?;
 
     // The wire protocol needs an identifier; use the verified archive's content identity.
@@ -28,8 +28,6 @@ async fn download(config: &Config, archive: &Path) -> Result<()> {
             "cp".as_ref(),
             config.artifact_uri.as_ref(),
             archive.as_os_str(),
-            "--region".as_ref(),
-            "eu-central-1".as_ref(),
             "--only-show-errors".as_ref(),
             "--no-progress".as_ref(),
         ],
@@ -64,14 +62,14 @@ async fn verify(archive: &Path, expected_sha256: &str) -> Result<String> {
     Ok(digest)
 }
 
-async fn extract(archive: &Path, executable: &Path) -> Result<()> {
+async fn extract(archive: &Path, executable: &Path, name: &str) -> Result<()> {
     let listing = process::output(
         "tar",
         &["-tzf".as_ref(), archive.as_os_str()],
         Duration::from_secs(30),
     )
     .await?;
-    let member = bundle_member(std::str::from_utf8(&listing)?)?;
+    let member = bundle_member(std::str::from_utf8(&listing)?, name)?;
 
     let types = process::output(
         "tar",
@@ -126,7 +124,7 @@ async fn readelf(option: &str, executable: &Path) -> Result<String> {
     )?)
 }
 
-fn bundle_member(listing: &str) -> Result<String> {
+fn bundle_member(listing: &str, name: &str) -> Result<String> {
     let mut root = None;
     let mut executable = None;
 
@@ -149,7 +147,7 @@ fn bundle_member(listing: &str) -> Result<String> {
         );
         root = Some(directory);
 
-        if filename == "biometric-engines-worker" {
+        if filename == name {
             ensure!(executable.is_none(), "duplicate bundle executable");
             executable = Some(entry.to_owned());
         } else {
@@ -163,6 +161,8 @@ fn bundle_member(listing: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WORKER: &str = "biometric-engines-worker";
 
     #[tokio::test]
     async fn verifies_downloaded_bytes_against_the_configured_checksum() {
@@ -184,11 +184,11 @@ mod tests {
     #[test]
     fn accepts_only_one_executable_under_one_directory() {
         assert_eq!(
-            bundle_member("release/\nrelease/biometric-engines-worker\n").unwrap(),
+            bundle_member("release/\nrelease/biometric-engines-worker\n", WORKER).unwrap(),
             "release/biometric-engines-worker"
         );
         assert_eq!(
-            bundle_member("release/biometric-engines-worker\n").unwrap(),
+            bundle_member("release/biometric-engines-worker\n", WORKER).unwrap(),
             "release/biometric-engines-worker"
         );
         for listing in [
@@ -199,7 +199,7 @@ mod tests {
             "a/biometric-engines-worker\na/lib.so",
             "a/",
         ] {
-            assert!(bundle_member(listing).is_err(), "{listing}");
+            assert!(bundle_member(listing, WORKER).is_err(), "{listing}");
         }
     }
 }
