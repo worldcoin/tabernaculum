@@ -8,7 +8,7 @@ A closed worker executable reaches the enclave once at boot, is verified, and ru
 |---|---|
 | `tabernaculum-bundle` | Bundle format and verification; enclave-side bootstrap (`enclave` feature) and host-side provisioning (`host` feature) over vsock |
 | `tabernaculum` | Minijail jail and seccomp policy, worker lifecycle, framed request/response connection (Linux x86_64) |
-| `tabernaculum-provisioner` | Host lifecycle library and sidecar: fetches the worker bundle from S3, starts the enclave and provisions the worker |
+| `tabernaculum-provisioner` | Sideloading library with explicit options; standalone sidecar that fetches the worker from S3 and owns the enclave lifecycle |
 
 Workers start from the reviewed seccomp policy in `sandbox/worker.policy`. An enclave adjusts single entries in code; the launch, IPC and process-creation entries are locked:
 
@@ -19,44 +19,56 @@ static POLICY: LazyLock<Policy> = LazyLock::new(|| Policy::default_worker().allo
 Deploy repos build their provisioner image on the published base, pinned by digest, and add their EIF:
 
 ```dockerfile
-FROM ghcr.io/worldcoin/tabernaculum-provisioner:v0.1.0@sha256:…
+FROM ghcr.io/worldcoin/tabernaculum-provisioner:<matching-tag>@sha256:…
 COPY enclave.eif /home/enclave.eif
 ```
 
 Each `v*` tag publishes the image; the run summary shows its digest. Consumers pin a git tag until the API settles.
 
-## Application initialization
+## Programmatic provisioning
 
-Applications that need additional enclave configuration before readiness can depend on
-`tabernaculum-provisioner` and call `run` from their own Linux executable:
+Applications with their own enclave lifecycle can call `provision` with a local executable:
 
 ```rust
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tabernaculum_provisioner::run(|cid| async move {
-        load_application_configuration(cid).await?;
-        wait_for_application_health(cid).await
+use std::{path::PathBuf, time::Duration};
+use tabernaculum_provisioner::{ProvisionOptions, provision};
+
+async fn sideload(worker_path: PathBuf, enclave_cid: u32) -> anyhow::Result<()> {
+    provision(ProvisionOptions {
+        executable: worker_path,
+        enclave_cid,
+        io_timeout: Duration::from_secs(120),
     }).await
 }
 ```
 
-The two application functions above represent the caller's own protocol. For example,
-Flamingo can load its release manifest over Pontifex and then check release-aware health.
-Tabernaculum does not interpret that manifest or depend on the application transport.
+The caller downloads, verifies and extracts its artifact if necessary, and launches the enclave.
+`provision` generates transfer metadata from the executable, sends it over vsock and waits for
+worker initialization acknowledgement. Keep the executable available and unchanged through that
+call. The library takes all configuration through arguments and owns no enclave lifecycle,
+signal handlers or readiness files.
 
-The callback runs once, after the bundle acknowledgement and before the ready file is
-written. The application's RPC server may still be starting: the callback owns connection
-retries and application health checks. Download, worker startup and application initialization
-share `BOOTSTRAP_TIMEOUT_SECONDS`; a rejected configuration should return an error.
-After initialization, the provisioner checks that its enclave is still running before
-publishing readiness. Ongoing monitoring remains a Nitro running-state check.
+After acknowledgement, Flamingo's provisioner can load its release manifest over Pontifex and
+check application health before publishing readiness. Its server may still be starting, so the
+caller owns those connection retries. The caller also owns the overall bootstrap deadline and
+must terminate the enclave on failure or cancellation. Dropping `provision` closes its transfer
+socket. `io_timeout` bounds connection retries and individual socket operations, not total startup.
 
-The library uses the same environment settings as the binary and owns SIGTERM/SIGINT handling,
-readiness cleanup and termination of its enclave. The callback must be cancellation-safe:
-a timeout or shutdown drops it before cleanup. Do not detach initialization tasks or block
-the executor. Drive `run` to completion; dropping or aborting it bypasses asynchronous cleanup.
-Initialize logging in the application, and run only one provisioner lifecycle per process.
+The standalone binary retains its existing environment configuration and lifecycle: download and
+verify the archive, inspect the executable, launch the enclave, sideload the worker, mark readiness,
+monitor Nitro state, and clean up on failure or shutdown. These modules remain private to the
+binary. Custom images must copy their own provisioner executable and override `ENTRYPOINT`.
 
-The existing binary supplies a no-op callback. Custom images can continue to use the provisioner
-base for its system dependencies, but must copy their executable and override `ENTRYPOINT`.
-Every new enclave lifecycle invokes initialization again; no bootstrap wire-format change is needed.
+## Bootstrap format compatibility
+
+This checkout uses manifest version **4**, containing only `manifest_version`, `sha384` and `size`.
+The diagnostic `release_id` has been removed from the wire format, `Manifest`, `VerifiedRuntime`
+and the lower-level `Bundle::prepare` argument list. Preparation now takes only an executable path.
+Executable size limits and SHA-384 transfer integrity checks remain unchanged. Artifact authenticity
+remains the deployment's responsibility; the standalone binary still verifies its archive checksum.
+
+Version 4 is incompatible with version 3 (used by `v0.1.0`): old receivers require `release_id`, and
+new receivers reject both older versions and unknown fields. Update the provisioner image and the
+enclave's Tabernaculum dependency together, rebuild the EIF, and deploy a matching pair. Existing
+tracks can retain their matching older pair. Consumers must remove any use of `runtime.release_id`
+from diagnostics; Flamingo's WIP release manifest and `release_hash` are separate and unchanged.

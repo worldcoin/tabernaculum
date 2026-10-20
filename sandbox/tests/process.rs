@@ -199,8 +199,7 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
 
         let bytes = std::fs::read(root.join(WORKER_PATH))?;
         let manifest = serde_json::to_vec(&Manifest {
-            manifest_version: 3,
-            release_id: "public-test-fixture".to_owned(),
+            manifest_version: 4,
             sha384: hex::encode(Sha384::digest(&bytes)),
             size: bytes.len() as u64,
         })?;
@@ -237,10 +236,6 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
     };
 
     if case == "provisioned-runtime" {
-        assert_eq!(
-            verified_runtime.as_ref().unwrap().release_id,
-            "public-test-fixture"
-        );
         worker.check_alive();
         assert_eq!(worker.exchange(&request(1))?, request(1));
         assert_eq!(worker.exchange(&request(2))?, request(2));

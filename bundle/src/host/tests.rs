@@ -190,13 +190,14 @@ async fn fixture(size: usize) -> (tempfile::TempDir, Bundle) {
     bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
     tokio::fs::write(&path, bytes).await.unwrap();
 
-    let bundle = Bundle::prepare("test-release", &path).await.unwrap();
+    let bundle = Bundle::prepare(&path).await.unwrap();
     (directory, bundle)
 }
 
 #[tokio::test]
 async fn direct_stream_matches_packaged_bytes_and_existing_receiver() {
     let (_source, bundle) = fixture(128 * 1024).await;
+    let expected_sha384 = bundle.manifest.sha384.clone();
     let mut packaged = Vec::new();
     crate::package(
         &mut packaged,
@@ -218,7 +219,7 @@ async fn direct_stream_matches_packaged_bytes_and_existing_receiver() {
             destination.path(),
         )
         .unwrap();
-        assert_eq!(runtime.release_id, "test-release");
+        assert_eq!(runtime.sha384, expected_sha384);
 
         receiver.write_all(&[0]).await.unwrap();
         receiver.shutdown().await.unwrap();
@@ -360,7 +361,7 @@ async fn symlinks_are_not_bundle_executables() {
     std::os::unix::fs::symlink(&bundle.executable, &link).unwrap();
 
     assert!(matches!(
-        Bundle::prepare("test-release", &link).await,
+        Bundle::prepare(&link).await,
         Err(Error::InvalidBundle)
     ));
 }

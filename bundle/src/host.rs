@@ -76,8 +76,8 @@ pub struct Bundle {
 }
 
 impl Bundle {
-    /// Hashes one regular executable and validates its size and release metadata.
-    pub async fn prepare(release_id: &str, executable: &Path) -> Result<Self, Error> {
+    /// Hashes one regular executable and validates its size and bundle metadata.
+    pub async fn prepare(executable: &Path) -> Result<Self, Error> {
         let mut file = open(executable).await?;
         let size = file
             .metadata()
@@ -112,8 +112,7 @@ impl Bundle {
         }
 
         let manifest = Manifest {
-            manifest_version: 3,
-            release_id: release_id.to_owned(),
+            manifest_version: 4,
             sha384: hex::encode(digest.finalize()),
             size,
         };
