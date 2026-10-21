@@ -8,14 +8,13 @@ use tokio::io::AsyncReadExt;
 pub async fn fetch(config: &Config, directory: &Path) -> Result<Bundle> {
     let archive = directory.join("artifact.tar.gz");
     download(config, &archive).await?;
-    let digest = verify(&archive, &config.artifact_sha256).await?;
+    verify(&archive, &config.artifact_sha256).await?;
 
     let executable = directory.join("executable");
     extract(&archive, &executable, &config.executable_name).await?;
     inspect(&executable).await?;
 
-    // The wire protocol needs an identifier; use the verified archive's content identity.
-    Bundle::prepare(&format!("sha256-{digest}"), &executable)
+    Bundle::prepare(&executable)
         .await
         .context("cannot prepare sandbox bundle")
 }

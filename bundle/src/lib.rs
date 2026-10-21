@@ -36,10 +36,8 @@ pub const MAX_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    /// Version 3 contains one unsigned executable; older signed formats are not accepted.
+    /// Version 4 contains one unsigned executable without deployment labels.
     pub manifest_version: u32,
-    /// Deployment-assigned diagnostic identifier, not an anti-rollback counter.
-    pub release_id: String,
     /// Lowercase hex SHA-384 of the entire executable.
     pub sha384: String,
     /// Exact nonzero executable bytes following the declared metadata.
@@ -52,8 +50,6 @@ pub struct VerifiedRuntime {
     pub binary: File,
     /// Fresh root containing only the verified executable; no write handles survive.
     pub root: TempDir,
-    /// Deployment-supplied diagnostic release identifier.
-    pub release_id: String,
     /// SHA-384 checked against the transferred executable (not a publisher identity).
     pub sha384: String,
 }
@@ -94,13 +90,7 @@ impl Manifest {
             return Err(Error::InvalidConfig);
         }
 
-        if self.manifest_version != 3
-            || self.release_id.is_empty()
-            || self.release_id.len() > 128
-            || !self
-                .release_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        if self.manifest_version != 4
             || self.size == 0
             || self.size > max_bundle_bytes
             || self.sha384.len() != 96
@@ -184,7 +174,6 @@ pub fn receive(
     Ok(VerifiedRuntime {
         binary,
         root,
-        release_id: manifest.release_id,
         sha384: manifest.sha384,
     })
 }

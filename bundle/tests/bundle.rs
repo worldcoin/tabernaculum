@@ -27,8 +27,7 @@ impl Fixture {
         elf[18] = 62;
         Self {
             manifest: Manifest {
-                manifest_version: 3,
-                release_id: "test-release".into(),
+                manifest_version: 4,
                 sha384: hex::encode(Sha384::digest(&elf)),
                 size: elf.len() as u64,
             },
@@ -49,11 +48,11 @@ impl Fixture {
 
 /// Only verified regular files and a read-only worker descriptor survive a successful transfer.
 #[test]
-fn exact_release_round_trips() {
+fn exact_executable_round_trips() {
     let fixture = Fixture::new();
     let parent = tempfile::tempdir().unwrap();
     let runtime = receive(&mut Cursor::new(fixture.bundle()), 1024, parent.path()).unwrap();
-    assert_eq!(runtime.release_id, "test-release");
+    assert_eq!(runtime.sha384, fixture.manifest.sha384);
     let path = runtime.root.path().join(WORKER_PATH);
     assert_eq!(fs::read(&path).unwrap(), fixture.binary);
     assert_eq!(
@@ -95,6 +94,33 @@ fn old_format_and_publisher_paths_are_rejected() {
         )
         .is_err()
     );
+}
+
+/// Version 3 and deployment labels are rejected before reading or staging an executable.
+#[test]
+fn legacy_version_and_release_identifiers_are_rejected_before_staging() {
+    let fixture = Fixture::new();
+    let parent = tempfile::tempdir().unwrap();
+    for (version, legacy_identifier) in [(3, false), (3, true), (4, true)] {
+        let mut metadata = serde_json::to_value(&fixture.manifest).unwrap();
+        metadata["manifest_version"] = version.into();
+        if legacy_identifier {
+            metadata["release_id"] = "legacy-release".into();
+        }
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(metadata.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&metadata);
+        bytes.extend_from_slice(&fixture.binary);
+        let mut reader = Cursor::new(bytes);
+
+        assert!(matches!(
+            receive(&mut reader, 1024, parent.path()),
+            Err(Error::InvalidManifest)
+        ));
+        assert_eq!(reader.position(), 4 + metadata.len() as u64);
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
 }
 
 /// Missing configuration and oversized executables never allocate artifact bodies.
@@ -218,10 +244,9 @@ async fn packaging_matches_the_receiver_and_rejects_changed_files() {
     let source = tempfile::tempdir().unwrap();
     let executable = source.path().join("worker");
     fs::write(&executable, &fixture.binary).unwrap();
-    let bundle =
-        tabernaculum_bundle::host::Bundle::prepare(&fixture.manifest.release_id, &executable)
-            .await
-            .unwrap();
+    let bundle = tabernaculum_bundle::host::Bundle::prepare(&executable)
+        .await
+        .unwrap();
     let manifest: Manifest = serde_json::from_slice(&bundle.manifest().unwrap()).unwrap();
     assert_eq!(
         serde_json::to_value(manifest).unwrap(),
