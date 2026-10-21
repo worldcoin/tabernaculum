@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "tabernaculum"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "libc",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "tabernaculum-bundle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "libc",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "tabernaculum-provisioner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hex",
