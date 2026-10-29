@@ -7,12 +7,17 @@
 #![deny(clippy::all, missing_docs)]
 
 mod connection;
+#[cfg(target_os = "linux")]
+mod debug;
+mod output;
 mod policy;
 #[cfg(target_os = "linux")]
 mod process;
 mod transport;
 
 pub use connection::{ConnectionConfig, ConnectionError};
+#[cfg(target_os = "linux")]
+pub use debug::{DebugEnclave, DebugEnclaveError, WorkerOutput};
 pub use policy::{Policy, PolicyError};
 #[cfg(target_os = "linux")]
 pub use process::{SandboxConfig, WORKER_UID, Worker, WorkerError, check_alive_if_idle};

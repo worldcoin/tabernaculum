@@ -59,6 +59,33 @@ verify the archive, inspect the executable, launch the enclave, sideload the wor
 monitor Nitro state, and clean up on failure or shutdown. These modules remain private to the
 binary. Custom images must copy their own provisioner executable and override `ENTRYPOINT`.
 
+## Debug output
+
+Worker stdout and stderr are `/dev/null` by default. A debug enclave (all PCRs zeroed, checked
+through the NSM) can forward them as `tabernaculum::worker` tracing events instead. A leading
+`ERROR`/`WARN`/`DEBUG`/`TRACE` token sets each line's level; other lines are INFO:
+
+```rust
+let sandbox = SandboxConfig {
+    root,
+    limits: Limits::default(),
+    policy: &POLICY,
+    // Discards, with a warning, in a measured enclave; errors if the NSM is unreadable.
+    output: if forward { WorkerOutput::forward_if_debug()? } else { WorkerOutput::Discard },
+};
+```
+
+The enclave's subscriber formats and filters these events like its own, so `RUST_LOG` must admit
+`tabernaculum::worker`. Lines are capped at 8 KiB and control characters are replaced. A
+subscriber slower than the worker drops lines and reports the count instead of blocking it. After a
+fatal worker failure, its remaining output is drained for up to 500 ms before `on_fatal` runs.
+
+On the host, `forward_console` relays a debug enclave's `nitro-cli console` to stdout line by line,
+reattaching with backoff until dropped. The standalone provisioner enables it with
+`ENCLAVE_CONSOLE_LOGS=true`, which requires `ENCLAVE_DEBUG_MODE=true`. Lines are passed through
+unchanged apart from sanitizing, so an enclave that logs Datadog JSON without ANSI colours is
+parsed by the node agent directly. Output from before the console attached is not replayed.
+
 ## Bootstrap format compatibility
 
 This checkout uses manifest version **4**, containing only `manifest_version`, `sha384` and `size`.

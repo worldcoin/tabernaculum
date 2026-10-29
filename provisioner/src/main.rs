@@ -7,8 +7,10 @@ mod process;
 use anyhow::{Context, Result};
 use config::Config;
 use enclave::{Enclave, clear_readiness};
+use tabernaculum_provisioner::{ConsoleOptions, forward_console};
 use tokio::{
     signal::unix::{SignalKind, signal},
+    task::JoinHandle,
     time::timeout,
 };
 
@@ -35,8 +37,10 @@ async fn main() -> Result<()> {
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
 
+    // Outlives bootstrap so teardown output is relayed too.
+    let mut relay = None;
     let result = tokio::select! {
-        result = run_enclave(&config, &enclave, directory.path()) => result,
+        result = run_enclave(&config, &enclave, directory.path(), &mut relay) => result,
         _ = terminate.recv() => Ok(()),
         _ = interrupt.recv() => Ok(()),
     };
@@ -48,6 +52,7 @@ async fn main() -> Result<()> {
 
     let readiness = clear_readiness(&config.ready_file).await;
     let termination = enclave.stop().await;
+    drop(relay);
 
     readiness?;
     termination.context("enclave termination failed")?;
@@ -55,17 +60,34 @@ async fn main() -> Result<()> {
     result
 }
 
+/// Stops the console relay with the enclave it follows.
+struct Relay(JoinHandle<()>);
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn run_enclave(
     config: &Config,
     enclave: &Enclave<'_>,
     directory: &std::path::Path,
+    relay: &mut Option<Relay>,
 ) -> Result<()> {
     timeout(config.bootstrap_timeout, async {
         tracing::debug!("fetching sandbox bundle");
         let bundle = artifact::fetch(config, directory).await?;
 
         tracing::debug!("launching enclave");
-        enclave.launch().await?;
+        let enclave_id = enclave.launch().await?;
+        // Attach before provisioning so the worker's startup output is relayed.
+        if config.console_logs {
+            *relay = Some(Relay(tokio::spawn(async move {
+                let Err(error) = forward_console(ConsoleOptions { enclave_id }).await;
+                tracing::error!(error = format!("{error:#}"), "enclave console relay failed");
+            })));
+        }
 
         tracing::debug!("provisioning sandbox bundle");
         bundle.provision(config.cid, config.io_timeout).await?;

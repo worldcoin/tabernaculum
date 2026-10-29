@@ -8,13 +8,21 @@ use std::{
     io,
     os::{fd::AsRawFd, unix::net::UnixStream},
     sync::Arc,
+    time::Duration,
 };
 
-use crate::{ConnectionConfig, ConnectionError, connection::Connection};
+use crate::{
+    ConnectionConfig, ConnectionError, WorkerOutput,
+    connection::Connection,
+    output::{self, Forwarder},
+};
 
 #[path = "jail.rs"]
 mod jail;
 pub use jail::{SandboxConfig, WORKER_UID};
+
+/// Lets a killed worker's last output reach the subscriber before the enclave exits.
+const OUTPUT_DRAIN: Duration = Duration::from_millis(500);
 
 // Upstream's Cargo fallback builds static Minijail but does not declare its libcap dependency.
 #[link(name = "cap")]
@@ -28,12 +36,15 @@ pub struct Worker {
     pid: libc::pid_t,
     /// Enclave-owned exit policy; must not unwind or wait for worker cleanup.
     on_fatal: fn(ConnectionError) -> !,
+    /// Present only when a debug enclave forwards worker stdout/stderr.
+    output: Option<Forwarder>,
 }
 
 impl Worker {
     /// Launches an open executable with FD 3 inside the embedded sandbox and returns it with
     /// its undecoded readiness frame. Call from a single-threaded bootstrap before generating
     /// keys. `on_fatal` must exit the enclave process immediately, not panic or stop a task.
+    /// Forwarded output starts reader threads after the fork.
     ///
     /// # Errors
     /// Returns an error if the sandbox, configuration or launch is invalid, or the worker
@@ -46,17 +57,25 @@ impl Worker {
     ) -> Result<(Self, Vec<u8>), WorkerError> {
         config.validate()?;
         let (rpc, child) = UnixStream::pair()?;
+        let pipes = match &sandbox.output {
+            WorkerOutput::Discard => None,
+            WorkerOutput::Forward(_) => Some([output::pipe()?, output::pipe()?]),
+        };
 
         let jail = sandbox.create_jail()?;
+        let mut fds = vec![(child.as_raw_fd(), 3), (binary.as_raw_fd(), 4)];
+        if let Some([(_, stdout), (_, stderr)]) = &pipes {
+            fds.extend([(stdout.as_raw_fd(), 1), (stderr.as_raw_fd(), 2)]);
+        }
 
         let argv = [c"worker".as_ptr(), c"--bundled".as_ptr(), std::ptr::null()];
         let envp = [std::ptr::null::<libc::c_char>()];
         // SAFETY: Minijail checks that the caller is single-threaded and remaps/closes FDs.
         // In the child, only libc calls run; failed exec exits without dropping Rust owners.
         // run_fd_remap uses LD_PRELOAD, which would let a supplied loader run before seccomp.
-        let pid = unsafe { jail.fork_remap(&[(child.as_raw_fd(), 3), (binary.as_raw_fd(), 4)])? };
+        let pid = unsafe { jail.fork_remap(&fds)? };
         if pid == 0 {
-            // SAFETY: FD 4 is the executable. Close it on exec; only IPC and null stdio survive.
+            // SAFETY: FD 4 is the executable. Close it on exec; only IPC and stdio survive.
             unsafe {
                 if libc::fcntl(4, libc::F_SETFD, libc::FD_CLOEXEC) == 0 {
                     libc::syscall(
@@ -77,8 +96,18 @@ impl Worker {
         drop(jail);
         // Close the parent's duplicate so an initialization failure is observed as EOF.
         drop(child);
+        let output = match pipes {
+            None => None,
+            Some([(stdout, stdout_writer), (stderr, stderr_writer)]) => {
+                // Readers reach EOF at worker exit only once the parent holds no write end.
+                drop((stdout_writer, stderr_writer));
+                let streams = [("stdout", stdout), ("stderr", stderr)];
+                Some(Forwarder::start(pid, streams).inspect_err(|_| kill(pid))?)
+            }
+        };
         let (connection, ready) = Connection::open(rpc, config).map_err(|error| {
             kill(pid);
+            drain(output.as_ref());
             WorkerError::Connection(error)
         })?;
 
@@ -87,6 +116,7 @@ impl Worker {
                 connection,
                 pid,
                 on_fatal,
+                output,
             },
             ready,
         ))
@@ -103,8 +133,7 @@ impl Worker {
         let result = self.connection.exchange(request);
         if let Some(error) = self.connection.failure().cloned() {
             tracing::error!(dependency = "worker", pid = self.pid, %error, "worker exchange failed");
-            kill(self.pid);
-            (self.on_fatal)(error);
+            self.terminate(error);
         }
 
         result
@@ -118,8 +147,7 @@ impl Worker {
             "worker response rejected"
         );
         self.connection.close(ConnectionError::Protocol);
-        kill(self.pid);
-        (self.on_fatal)(ConnectionError::Protocol)
+        self.terminate(ConnectionError::Protocol)
     }
 
     /// Detects idle exits without reaping, signalling a healthy worker, or sending IPC.
@@ -145,9 +173,14 @@ impl Worker {
 
         if let Some(error) = error {
             tracing::error!(dependency = "worker", pid = self.pid, %error, "worker liveness check failed");
-            kill(self.pid);
-            (self.on_fatal)(ConnectionError::Transport(Arc::new(error)));
+            self.terminate(ConnectionError::Transport(Arc::new(error)));
         }
+    }
+
+    fn terminate(&self, error: ConnectionError) -> ! {
+        kill(self.pid);
+        drain(self.output.as_ref());
+        (self.on_fatal)(error)
     }
 }
 
@@ -158,6 +191,12 @@ pub fn check_alive_if_idle(worker: &std::sync::Mutex<Worker>) {
         Ok(worker) => worker.check_alive(),
         Err(std::sync::TryLockError::Poisoned(worker)) => worker.into_inner().check_alive(),
         Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+}
+
+fn drain(output: Option<&Forwarder>) {
+    if let Some(output) = output {
+        output.drain(OUTPUT_DRAIN);
     }
 }
 
@@ -174,9 +213,10 @@ fn kill(pid: libc::pid_t) {
 }
 
 impl Drop for Worker {
-    /// Requests termination on normal shutdown or unwinding, without reaping.
+    /// Requests termination on normal shutdown or unwinding, without reaping, then drains output.
     fn drop(&mut self) {
         kill(self.pid);
+        drain(self.output.as_ref());
     }
 }
 

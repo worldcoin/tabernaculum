@@ -6,8 +6,8 @@ use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, process::Command, 
 
 #[cfg(target_os = "linux")]
 use tabernaculum::{
-    ConnectionConfig, ConnectionError, Limits, Policy, SandboxConfig, WORKER_UID, Worker,
-    WorkerError,
+    ConnectionConfig, ConnectionError, DebugEnclave, Limits, Policy, SandboxConfig, WORKER_UID,
+    Worker, WorkerError, WorkerOutput,
 };
 
 #[cfg(target_os = "linux")]
@@ -48,6 +48,43 @@ fn sandbox(root: &Path) -> SandboxConfig<'_> {
             max_threads: 8,
         },
         policy: &POLICY,
+        output: WorkerOutput::Discard,
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Forwarding cases stand in for a debug enclave and log to the supervisor through stderr.
+fn sandbox_for<'a>(case: &str, root: &'a Path) -> SandboxConfig<'a> {
+    if !case.starts_with("forward-") {
+        return sandbox(root);
+    }
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    static STALLED: AtomicBool = AtomicBool::new(false);
+    struct Stderr(bool);
+    impl Write for Stderr {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0 && !STALLED.swap(true, Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            std::io::stderr().write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::stderr().flush()
+        }
+    }
+    let stall = case == "forward-stalled-subscriber";
+    tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || Stderr(stall))
+        .init();
+    SandboxConfig {
+        output: WorkerOutput::Forward(DebugEnclave::assume_for_tests()),
+        ..sandbox(root)
     }
 }
 
@@ -172,6 +209,7 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
                             max_threads
                         },
                         policy: &POLICY,
+                        output: WorkerOutput::Discard,
                     },
                     config(),
                     fatal
@@ -226,7 +264,8 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
     if case == "startup-timeout" {
         limits.startup_timeout = Duration::from_millis(50);
     }
-    let mut worker = match Worker::spawn(executable, sandbox(runtime_root), limits, fatal) {
+    let mut worker = match Worker::spawn(executable, sandbox_for(case, runtime_root), limits, fatal)
+    {
         Ok((worker, ready)) => {
             assert_eq!(ready, b"ready");
             worker
@@ -241,6 +280,21 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
         assert_eq!(worker.exchange(&request(2))?, request(2));
         worker.exchange(&request(253))?;
         panic!("provisioned worker crash must terminate the broker");
+    }
+
+    if case == "forward-output" {
+        assert_eq!(worker.exchange(&request(230))?, request(230));
+        // Drop drains the output the killed worker already wrote.
+        drop(worker);
+        return Ok(());
+    }
+
+    if case == "forward-stalled-subscriber" {
+        // The request deadline fails this exchange if a stalled subscriber blocks the worker.
+        assert_eq!(worker.exchange(&request(231))?, request(231));
+        std::thread::sleep(Duration::from_secs(4));
+        drop(worker);
+        return Ok(());
     }
 
     if case == "moved-owner" {
@@ -392,6 +446,7 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
         "read-hostname" => 219,
         "timeout" | "first-request-timeout" | "kill-failure" => 252,
         "model-error" => 254,
+        "forward-crash" => 232,
         "bad-executable" => 1,
         _ => panic!("unknown broker case: {case}"),
     };
@@ -472,21 +527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("model-error", Some("worker socket I/O failed")),
         ("bad-executable", Some("worker socket I/O failed")),
     ] {
-        let output = Command::new("timeout")
-            .args([
-                "--kill-after=1s",
-                "10s",
-                "unshare",
-                "--fork",
-                "--pid",
-                "--mount-proc",
-                "--kill-child",
-                "--",
-            ])
-            .arg(std::env::current_exe()?)
-            .arg(case)
-            .arg(&root)
-            .output()?;
+        let output = run_broker(case, &root)?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
@@ -501,9 +542,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let red = "ERROR tabernaculum::worker: ERROR worker \u{FFFD}[31mred\u{FFFD}[0m";
+    let cut = format!("tabernaculum::worker: {} dependency", "x".repeat(8192));
+    for (case, code, expected) in [
+        (
+            "forward-output",
+            0,
+            &[
+                r#"INFO tabernaculum::worker: worker stdout line dependency="worker""#,
+                r#"stream="stdout" truncated=false"#,
+                red,
+                r#"stream="stderr" truncated=true"#,
+                &cut,
+            ][..],
+        ),
+        (
+            "forward-stalled-subscriber",
+            0,
+            &[
+                "first line stalls the subscriber",
+                "worker output lines dropped: log subscriber too slow",
+            ],
+        ),
+        (
+            "forward-crash",
+            FATAL_EXIT,
+            &["worker last words", "fatal_worker:worker socket I/O failed"],
+        ),
+    ] {
+        let output = run_broker(case, &root)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(code), "{case}: {stderr}");
+        // Streams interleave freely, but a fatal exit must wait for the worker's last output.
+        let mut rest = &*stderr;
+        for text in expected {
+            let at = rest
+                .find(text)
+                .unwrap_or_else(|| panic!("{case}: missing {text:?}: {stderr}"));
+            if case == "forward-crash" {
+                rest = &rest[at + text.len()..];
+            }
+        }
+    }
+
     std::fs::remove_dir_all(&temp)?;
     println!("Production Minijail confinement, resource limits and broker lifecycle tests passed");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// Runs one broker as PID 1 of its own namespace under a deadline.
+fn run_broker(case: &str, root: &Path) -> std::io::Result<std::process::Output> {
+    Command::new("timeout")
+        .args([
+            "--kill-after=1s",
+            "10s",
+            "unshare",
+            "--fork",
+            "--pid",
+            "--mount-proc",
+            "--kill-child",
+            "--",
+        ])
+        .arg(std::env::current_exe()?)
+        .arg(case)
+        .arg(root)
+        .output()
 }
 
 #[cfg(not(target_os = "linux"))]

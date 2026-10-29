@@ -21,10 +21,13 @@ hex.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+aws-nitro-enclaves-nsm-api = "0.5.2"
 libc.workspace = true
 minijail.workspace = true
+serde_cbor = "0.11"
 
 [[bin]]
 name = "sandbox-test-worker"
