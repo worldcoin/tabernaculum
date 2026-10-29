@@ -8,6 +8,9 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{Result, ensure};
 use tabernaculum_bundle::host::Bundle;
 
+mod console;
+pub use console::{ConsoleOptions, forward_console};
+
 /// Explicit inputs for provisioning one already-running enclave.
 pub struct ProvisionOptions {
     /// Local worker executable, already downloaded and extracted by the caller.

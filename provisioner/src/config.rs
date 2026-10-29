@@ -9,6 +9,7 @@ pub struct Config {
     pub artifact_sha256: String,
     pub executable_name: String,
     pub debug_mode: bool,
+    pub console_logs: bool,
     pub cid: u32,
     pub cpus: u32,
     pub memory_mib: u32,
@@ -34,6 +35,13 @@ impl Config {
         let cid = number("ENCLAVE_CID", 16)?;
         ensure!(cid > 3, "enclave CID must be greater than 3");
 
+        let debug_mode = flag("ENCLAVE_DEBUG_MODE")?;
+        let console_logs = flag("ENCLAVE_CONSOLE_LOGS")?;
+        ensure!(
+            !console_logs || debug_mode,
+            "ENCLAVE_CONSOLE_LOGS requires ENCLAVE_DEBUG_MODE"
+        );
+
         let io_timeout = u64::from(number("PROVISIONING_IO_TIMEOUT_SECONDS", 120)?);
         ensure!(
             io_timeout <= 900,
@@ -46,9 +54,8 @@ impl Config {
             artifact_uri,
             artifact_sha256,
             executable_name,
-            debug_mode: setting("ENCLAVE_DEBUG_MODE", "false")
-                .parse()
-                .context("ENCLAVE_DEBUG_MODE must be true or false")?,
+            debug_mode,
+            console_logs,
             cid,
             cpus: number("ENCLAVE_CPU_COUNT", 2)?,
             memory_mib: number("ENCLAVE_MEMORY_SIZE", 6144)?,
@@ -73,6 +80,12 @@ fn required(name: &str) -> Result<String> {
 
 fn setting(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
+fn flag(name: &str) -> Result<bool> {
+    setting(name, "false")
+        .parse()
+        .with_context(|| format!("{name} must be true or false"))
 }
 
 fn number(name: &str, default: u32) -> Result<u32> {

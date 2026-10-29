@@ -70,12 +70,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::vars_os().next().is_none(),
         "inherited environment"
     );
-    for fd in 0..=2 {
+    let stat = |fd| {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
-        let stat = unsafe { stat.assume_init() };
-        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFCHR);
-        assert_eq!(stat.st_rdev, libc::makedev(1, 3), "stdio must be /dev/null");
+        unsafe { stat.assume_init() }
+    };
+    // A debug broker forwards stdout and stderr through pipes; stdin is always /dev/null.
+    let forwarded = stat(1).st_mode & libc::S_IFMT == libc::S_IFIFO;
+    for fd in 0..=2 {
+        let stat = stat(fd);
+        if forwarded && fd > 0 {
+            assert_eq!(
+                stat.st_mode & libc::S_IFMT,
+                libc::S_IFIFO,
+                "forwarded FD {fd}"
+            );
+        } else {
+            assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFCHR);
+            assert_eq!(stat.st_rdev, libc::makedev(1, 3), "stdio must be /dev/null");
+        }
         for request in [0x5401, 0x802c542a] {
             let mut terminal = [0_u8; 64];
             // SAFETY: both read-only queries receive a buffer larger than termios/termios2.
@@ -309,6 +322,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         thread.thread().unpark();
                         thread.join().unwrap();
                     }
+                }
+                230 => {
+                    println!("worker stdout line");
+                    eprintln!("ERROR worker \x1b[31mred\x1b[0m");
+                    eprintln!("{}", "x".repeat(20_000));
+                }
+                231 => {
+                    eprintln!("first line stalls the subscriber");
+                    std::thread::sleep(Duration::from_millis(100));
+                    // Far beyond pipe and queue capacity; must not block the response.
+                    let line = format!("{}\n", "y".repeat(1023));
+                    let mut stderr = io::stderr().lock();
+                    for _ in 0..4096 {
+                        stderr.write_all(line.as_bytes())?;
+                    }
+                }
+                232 => {
+                    eprintln!("worker last words");
+                    std::process::exit(3);
                 }
                 250 => return Ok(b"reject".to_vec()),
                 252 => unsafe {

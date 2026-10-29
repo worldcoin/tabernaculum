@@ -67,8 +67,19 @@ case "$1" in
             echo '[{"EnclaveID":"unrelated","EnclaveName":"another-owner","State":"RUNNING","Flags":"NONE"}]'
         fi
         ;;
+    console)
+        [[ "$2" == --enclave-id && "$3" == owned ]] || exit 99
+        printf '%s\n%s\n' '{"level":"INFO","message":"from \u001benclave"}' "$(head -c 20000 /dev/zero | tr '\0' z)"
+        echo console >> "$CASE_DIR/events"
+        exec sleep 30
+        ;;
     terminate-enclave)
         [[ "$2" == --enclave-id && "$3" == owned ]] || exit 99
+        if [[ "$SCENARIO" == console ]]; then
+            # The relay must stay attached until the enclave is gone.
+            for ((i=0; i<100; i++)); do grep -q '^console$' "$CASE_DIR/events" && break; sleep 0.05; done
+            sleep 0.5
+        fi
         echo terminate-owned >> "$CASE_DIR/events"
         [[ "$SCENARIO" != cleanup_fail ]] || exit 1
         rm -f "$CASE_DIR/owned"
@@ -89,6 +100,9 @@ run_case() {
     if [[ "$SCENARIO" == debug_launch_fail ]]; then export ENCLAVE_DEBUG_MODE=true; fi
     if [[ "$SCENARIO" == measured_launch_fail ]]; then export ENCLAVE_DEBUG_MODE=false; fi
     if [[ "$SCENARIO" == invalid_debug ]]; then export ENCLAVE_DEBUG_MODE=typo; fi
+    unset ENCLAVE_CONSOLE_LOGS
+    if [[ "$SCENARIO" == console_without_debug ]]; then export ENCLAVE_CONSOLE_LOGS=true; fi
+    if [[ "$SCENARIO" == console ]]; then export ENCLAVE_DEBUG_MODE=true ENCLAVE_CONSOLE_LOGS=true; fi
     mkdir -p "$CASE_DIR"
     export BUNDLE_READY_FILE="$CASE_DIR/ready"
     BUNDLE_ARTIFACT_SHA256=$(sha256sum "$ARCHIVE" | cut -d ' ' -f 1)
@@ -110,11 +124,11 @@ finish_failure() {
     echo "PASS: $SCENARIO"
 }
 
-for scenario in invalid_debug missing_uri empty_uri empty_checksum invalid_checksum download_fail checksum dynamic shared_library; do
+for scenario in invalid_debug console_without_debug missing_uri empty_uri empty_checksum invalid_checksum download_fail checksum dynamic shared_library; do
     run_case "$scenario"
     finish_failure
     assert_not grep -q '^launch$' "$CASE_DIR/events" 2>/dev/null
-    if [[ "$scenario" == invalid_debug || "$scenario" == missing_uri || "$scenario" == empty_uri || "$scenario" == empty_checksum ]]; then
+    if [[ "$scenario" == invalid_debug || "$scenario" == console_without_debug || "$scenario" == missing_uri || "$scenario" == empty_uri || "$scenario" == empty_checksum ]]; then
         assert_not grep -q '^download$' "$CASE_DIR/events" 2>/dev/null
     fi
 done
@@ -124,6 +138,15 @@ for scenario in launch_fail measured_launch_fail debug_launch_fail launch_timeou
     [[ $(grep -c '^launch$' "$CASE_DIR/events") == 1 ]]
     grep -q '^terminate-owned$' "$CASE_DIR/events"
 done
+
+# Provisioning fails without a real enclave; the relay must still copy console lines verbatim.
+run_case console
+finish_failure
+grep -q '^terminate-owned$' "$CASE_DIR/events"
+grep -qxF '{"level":"INFO","message":"from \u001benclave"}' "$CASE_DIR/output" || { echo "FAIL: console JSON not relayed"; cat "$CASE_DIR/output"; exit 1; }
+grep -qx "$(head -c 16384 /dev/zero | tr '\0' z) \[truncated\]" "$CASE_DIR/output" || { echo "FAIL: long console line not cut"; exit 1; }
+grep -q 'ENCLAVE_CONSOLE_LOGS requires ENCLAVE_DEBUG_MODE' "$suite/console_without_debug/output"
+echo 'PASS: debug console is relayed to stdout until termination'
 
 run_case signal_launch
 for ((i=0; i<100; i++)); do

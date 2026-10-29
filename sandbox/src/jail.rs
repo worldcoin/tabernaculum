@@ -12,7 +12,7 @@ use std::{
 
 use minijail::Minijail;
 
-use crate::{Limits, Policy, WorkerError};
+use crate::{Limits, Policy, WorkerError, WorkerOutput};
 
 /// Reserved exclusively for the worker inside the enclave, never the broker.
 pub const WORKER_UID: u32 = 65532;
@@ -26,6 +26,8 @@ pub struct SandboxConfig<'a> {
     pub limits: Limits,
     /// Seccomp policy, usually [`Policy::default_worker`] with per-entry adjustments.
     pub policy: &'a Policy,
+    /// Worker stdout/stderr; forwarding requires proof of a debug enclave.
+    pub output: WorkerOutput,
 }
 
 impl SandboxConfig<'_> {
