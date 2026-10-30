@@ -49,9 +49,11 @@ static CHECK_EARLY_SANDBOX: extern "C" fn() = {
     extern "C" fn check() {
         // SAFETY: These queries do not retain pointers or modify process state.
         unsafe {
+            // The single worker's UID, or a pool slot's (POOL_UID_BASE..+MAX_POOL_SIZE).
+            let uid = libc::getuid();
             if libc::getpid() != 1
-                || libc::getuid() != 65532
-                || libc::getgid() != 65532
+                || (uid != 65532 && !(70_000..70_064).contains(&uid))
+                || libc::getgid() != uid
                 || libc::getgroups(0, std::ptr::null_mut()) != 0
                 || libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1
                 || libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) != 2
@@ -309,6 +311,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         thread.thread().unpark();
                         thread.join().unwrap();
                     }
+                }
+                233 => return Ok(unsafe { libc::getuid() }.to_le_bytes().to_vec()),
+                234 => std::thread::sleep(Duration::from_millis(300)),
+                235 => {
+                    // Exits after replying, while idle.
+                    std::thread::spawn(|| {
+                        std::thread::sleep(Duration::from_millis(100));
+                        unsafe { libc::_exit(4) };
+                    });
                 }
                 250 => return Ok(b"reject".to_vec()),
                 252 => unsafe {

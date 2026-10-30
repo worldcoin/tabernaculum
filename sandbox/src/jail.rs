@@ -30,7 +30,7 @@ pub struct SandboxConfig<'a> {
 
 impl SandboxConfig<'_> {
     /// Builds the same fail-closed sandbox for production and adversarial fixtures.
-    pub(crate) fn create_jail(&self) -> Result<Minijail, WorkerError> {
+    pub(crate) fn create_jail(&self, uid: u32) -> Result<Minijail, WorkerError> {
         if self.limits.address_space_bytes == 0
             || self.limits.address_space_bytes > isize::MAX as u64
             || !(1..=256).contains(&self.limits.max_threads)
@@ -87,8 +87,8 @@ impl SandboxConfig<'_> {
             (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV)
                 as usize,
         )?;
-        jail.change_uid(WORKER_UID);
-        jail.change_gid(WORKER_UID);
+        jail.change_uid(uid);
+        jail.change_gid(uid);
         jail.set_supplementary_gids(&[]);
         jail.use_caps(0);
         for (resource, limit) in [

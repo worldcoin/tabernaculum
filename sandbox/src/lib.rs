@@ -8,12 +8,19 @@
 
 mod connection;
 mod policy;
+mod pool;
 #[cfg(target_os = "linux")]
 mod process;
 mod transport;
 
 pub use connection::{ConnectionConfig, ConnectionError};
 pub use policy::{Policy, PolicyError};
+#[cfg(target_os = "linux")]
+pub use pool::{Lease, Pool};
+pub use pool::{
+    MAX_POOL_SIZE, POOL_UID_BASE, PoolConfig, PoolError, PoolMode, PoolStatus, RestartPolicy,
+    WorkerId,
+};
 #[cfg(target_os = "linux")]
 pub use process::{SandboxConfig, WORKER_UID, Worker, WorkerError, check_alive_if_idle};
 /// The worker bundle format and enclave-side bootstrap.

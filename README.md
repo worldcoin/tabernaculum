@@ -25,6 +25,29 @@ COPY enclave.eif /home/enclave.eif
 
 Each `v*` tag publishes the image; the run summary shows its digest. Consumers pin a git tag until the API settles.
 
+## Worker pools
+
+`Pool::start` forks a single-threaded launcher at bootstrap. The launcher spawns, kills and reaps
+every pool worker, so the enclave can start threads first and add or replace workers later. Slot
+`i` runs as UID `POOL_UID_BASE + i`, so each worker has its own `max_threads` budget:
+
+```rust
+let pool = Pool::start(&runtime.binary, sandbox, connection, PoolConfig {
+    size: 4,
+    mode: PoolMode::Supervised,
+    ready: |ready| ready == b"ready",
+    ..PoolConfig::default()
+}, pool_failed)?;
+let response = pool.exchange(&request)?;
+```
+
+A worker failure retires only that worker and returns `PoolError::Worker`. A supervised pool
+replaces retired and killed workers, with jittered backoff after failures. More than
+`restart.max_failures` failures within `restart.window` call the fatal handler, so a request that
+crashes workers cannot be retried indefinitely. A manual pool leaves the slot empty until `spawn`.
+A request waits up to `acquire_timeout` for an idle worker, then fails with `PoolError::Busy`.
+`status().is_full()` suits readiness. Size enclave memory for `size × address_space_bytes`.
+
 ## Programmatic provisioning
 
 Applications with their own enclave lifecycle can call `provision` with a local executable:
