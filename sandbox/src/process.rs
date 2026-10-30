@@ -69,59 +69,12 @@ impl Worker {
         on_fatal: fn(ConnectionError) -> !,
     ) -> Result<StartingWorker, WorkerError> {
         config.validate()?;
-        let (rpc, child) = UnixStream::pair()?;
-        let jail = sandbox.create_jail()?;
-        // Minijail points stdio missing from this list at /dev/null.
-        let mut fds = vec![(child.as_raw_fd(), 3), (binary.as_raw_fd(), 4)];
-        let pipes = match &sandbox.output {
-            WorkerOutput::Discard => None,
-            WorkerOutput::Inherit => {
-                fds.extend([(1, 1), (2, 2)]);
-                None
-            }
-            WorkerOutput::Capture => {
-                let pipes = [io::pipe()?, io::pipe()?];
-                fds.extend([(pipes[0].1.as_raw_fd(), 1), (pipes[1].1.as_raw_fd(), 2)]);
-                Some(pipes)
-            }
-        };
-
-        let argv = [c"worker".as_ptr(), c"--bundled".as_ptr(), std::ptr::null()];
-        let envp = [std::ptr::null::<libc::c_char>()];
-        // SAFETY: Minijail checks that the caller is single-threaded and remaps/closes FDs.
-        // In the child, only libc calls run; failed exec exits without dropping Rust owners.
-        // run_fd_remap uses LD_PRELOAD, which would let a supplied loader run before seccomp.
-        let pid = unsafe { jail.fork_remap(&fds)? };
-        if pid == 0 {
-            // SAFETY: FD 4 is the executable. Close it on exec; only IPC and stdio survive.
-            unsafe {
-                if libc::fcntl(4, libc::F_SETFD, libc::FD_CLOEXEC) == 0 {
-                    libc::syscall(
-                        libc::SYS_execveat,
-                        4,
-                        c"".as_ptr(),
-                        argv.as_ptr(),
-                        envp.as_ptr(),
-                        libc::AT_EMPTY_PATH,
-                    );
-                }
-                libc::_exit(127);
-            }
-        }
-
-        // Minijail::drop only frees the parent's configuration; it neither signals nor waits
-        // for the child, so this owner can move to a blocking worker thread.
-        drop(jail);
-        // Close the parent's duplicate so an initialization failure is observed as EOF.
-        drop(child);
-        let (stdout, stderr) = match pipes {
-            None => (None, None),
-            Some([(stdout, stdout_writer), (stderr, stderr_writer)]) => {
-                // Readers reach EOF at worker exit only once the parent holds no write end.
-                drop((stdout_writer, stderr_writer));
-                (Some(stdout), Some(stderr))
-            }
-        };
+        let Launched {
+            pid,
+            rpc,
+            stdout,
+            stderr,
+        } = launch(binary, &sandbox, WORKER_UID)?;
 
         Ok(StartingWorker {
             worker: KillOnDrop(pid),
@@ -269,6 +222,82 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         kill(self.0);
     }
+}
+
+/// A freshly forked worker: its PID, the broker's IPC end, and captured output read ends.
+pub(crate) struct Launched {
+    pub(crate) pid: libc::pid_t,
+    pub(crate) rpc: UnixStream,
+    pub(crate) stdout: Option<PipeReader>,
+    pub(crate) stderr: Option<PipeReader>,
+}
+
+/// Forks one jailed worker running as `uid`.
+/// The caller must be single-threaded; Minijail refuses to fork otherwise.
+pub(crate) fn launch(
+    binary: &File,
+    sandbox: &SandboxConfig<'_>,
+    uid: u32,
+) -> Result<Launched, WorkerError> {
+    let (rpc, child) = UnixStream::pair()?;
+    let jail = sandbox.create_jail(uid)?;
+    // Minijail points stdio missing from this list at /dev/null.
+    let mut fds = vec![(child.as_raw_fd(), 3), (binary.as_raw_fd(), 4)];
+    let pipes = match &sandbox.output {
+        WorkerOutput::Discard => None,
+        WorkerOutput::Inherit => {
+            fds.extend([(1, 1), (2, 2)]);
+            None
+        }
+        WorkerOutput::Capture => {
+            let pipes = [io::pipe()?, io::pipe()?];
+            fds.extend([(pipes[0].1.as_raw_fd(), 1), (pipes[1].1.as_raw_fd(), 2)]);
+            Some(pipes)
+        }
+    };
+
+    let argv = [c"worker".as_ptr(), c"--bundled".as_ptr(), std::ptr::null()];
+    let envp = [std::ptr::null::<libc::c_char>()];
+    // SAFETY: Minijail checks that the caller is single-threaded and remaps/closes FDs.
+    // In the child, only libc calls run; failed exec exits without dropping Rust owners.
+    // run_fd_remap uses LD_PRELOAD, which would let a supplied loader run before seccomp.
+    let pid = unsafe { jail.fork_remap(&fds)? };
+    if pid == 0 {
+        // SAFETY: FD 4 is the executable. Close it on exec; only IPC and stdio survive.
+        unsafe {
+            if libc::fcntl(4, libc::F_SETFD, libc::FD_CLOEXEC) == 0 {
+                libc::syscall(
+                    libc::SYS_execveat,
+                    4,
+                    c"".as_ptr(),
+                    argv.as_ptr(),
+                    envp.as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                );
+            }
+            libc::_exit(127);
+        }
+    }
+
+    // Minijail::drop only frees the parent's configuration; it neither signals nor waits
+    // for the child, so this owner can move to a blocking worker thread.
+    drop(jail);
+    // Close the parent's duplicate so an initialization failure is observed as EOF.
+    drop(child);
+    let (stdout, stderr) = match pipes {
+        None => (None, None),
+        Some([(stdout, stdout_writer), (stderr, stderr_writer)]) => {
+            // Readers reach EOF at worker exit only once the parent holds no write end.
+            drop((stdout_writer, stderr_writer));
+            (Some(stdout), Some(stderr))
+        }
+    };
+    Ok(Launched {
+        pid,
+        rpc,
+        stdout,
+        stderr,
+    })
 }
 
 /// Checks liveness unless a request holds the lock; that request's exchange reports a dead

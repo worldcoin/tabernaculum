@@ -100,6 +100,11 @@ impl Connection {
         self.failure.as_ref()
     }
 
+    /// The open socket, for idle liveness probes; `None` once closed.
+    pub(crate) fn stream(&self) -> Option<&UnixStream> {
+        self.stream.as_ref()
+    }
+
     /// Sends one request and reads one response under a single deadline.
     /// An oversized request is rejected before sending and leaves the connection usable.
     pub(crate) fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, ConnectionError> {
