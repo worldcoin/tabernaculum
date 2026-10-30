@@ -6,8 +6,8 @@ use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, process::Command, 
 
 #[cfg(target_os = "linux")]
 use tabernaculum::{
-    ConnectionConfig, ConnectionError, Limits, Policy, SandboxConfig, WORKER_UID, Worker,
-    WorkerError,
+    ConnectionConfig, ConnectionError, Limits, POOL_UID_BASE, Policy, Pool, PoolConfig, PoolError,
+    PoolMode, RestartPolicy, SandboxConfig, WORKER_UID, Worker, WorkerError,
 };
 
 #[cfg(target_os = "linux")]
@@ -65,6 +65,169 @@ fn fatal(error: ConnectionError) -> ! {
 }
 
 #[cfg(target_os = "linux")]
+fn pool_fatal(error: PoolError) -> ! {
+    eprintln!("fatal_worker:{error}");
+    std::process::exit(FATAL_EXIT);
+}
+
+#[cfg(target_os = "linux")]
+fn pool_config(size: usize, mode: PoolMode, max_failures: usize) -> PoolConfig {
+    PoolConfig {
+        size,
+        mode,
+        acquire_timeout: Duration::from_secs(1),
+        health_interval: Duration::from_millis(20),
+        restart: RestartPolicy {
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(100),
+            max_failures,
+            window: Duration::from_secs(60),
+        },
+        ready: |ready| ready == b"ready",
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Polls the pool for up to three seconds.
+fn wait_for(pool: &Pool, done: impl Fn(&Pool) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !done(pool) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pool state not reached: {:?}",
+            pool.status()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn children(pid: i32) -> Vec<i32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap()
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+/// Pool cases: the launcher spawns every worker, also after the broker starts threads.
+fn pool_broker(case: &str, binary: &File, root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let broker = unsafe { libc::getpid() };
+    match case {
+        "pool-threaded" => {
+            std::thread::spawn(std::thread::park);
+            let settings = pool_config(1, PoolMode::Supervised, 5);
+            assert!(matches!(
+                Pool::start(binary, sandbox(root), config(), settings, pool_fatal),
+                Err(PoolError::MultiThreaded)
+            ));
+        }
+        "pool-supervised" => {
+            let settings = pool_config(3, PoolMode::Supervised, 5);
+            let pool = Pool::start(binary, sandbox(root), config(), settings, pool_fatal)?;
+            let [launcher] = children(broker)[..] else {
+                panic!("the broker must only parent the launcher");
+            };
+            assert_eq!(children(launcher).len(), 3);
+
+            // Each slot has its own UID, so held workers report distinct ones.
+            let mut leases = (0..3)
+                .map(|_| pool.acquire())
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut uids: Vec<_> = leases
+                .iter_mut()
+                .map(|lease| {
+                    let uid = lease.exchange(&request(233)).unwrap();
+                    u32::from_le_bytes(uid[..].try_into().unwrap())
+                })
+                .collect();
+            uids.sort_unstable();
+            assert_eq!(
+                uids,
+                (0..3).map(|slot| POOL_UID_BASE + slot).collect::<Vec<_>>()
+            );
+            assert!(matches!(pool.acquire(), Err(PoolError::Busy)));
+            // Per-UID thread budgets: one worker gets all seven extra threads.
+            assert_eq!(leases[0].exchange(&request(222))?, request(222));
+            drop(leases);
+
+            let started = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..3 {
+                    scope.spawn(|| assert_eq!(pool.exchange(&request(234)).unwrap(), request(234)));
+                }
+            });
+            assert!(
+                started.elapsed() < Duration::from_millis(800),
+                "requests ran serially"
+            );
+
+            let victim = pool.workers()[0];
+            pool.kill(victim)?;
+            wait_for(&pool, |pool| {
+                pool.status().is_full() && !pool.workers().contains(&victim)
+            });
+            assert_eq!(pool.status().recent_failures, 0);
+
+            // A crash, an idle exit and a seccomp kill each retire only their worker.
+            assert!(matches!(
+                pool.exchange(&request(253)),
+                Err(PoolError::Worker(_))
+            ));
+            wait_for(&pool, |pool| pool.status().is_full());
+            assert_eq!(pool.exchange(&request(235))?, request(235));
+            wait_for(&pool, |pool| {
+                pool.status().recent_failures == 2 && pool.status().is_full()
+            });
+            assert!(matches!(
+                pool.exchange(&request(202)),
+                Err(PoolError::Worker(_))
+            ));
+            wait_for(&pool, |pool| pool.status().is_full());
+            assert_eq!(pool.status().recent_failures, 3);
+
+            // Retired workers were reaped, not left as zombies.
+            assert_eq!(children(launcher).len(), 3);
+            drop(pool);
+            assert!(children(broker).is_empty());
+        }
+        "pool-manual" => {
+            let settings = pool_config(2, PoolMode::Manual, 5);
+            let pool = Pool::start(binary, sandbox(root), config(), settings, pool_fatal)?;
+            assert!(matches!(pool.spawn(), Err(PoolError::Full)));
+            pool.kill(pool.workers()[0])?;
+            assert_eq!(pool.workers().len(), 1);
+            assert!(matches!(
+                pool.exchange(&request(253)),
+                Err(PoolError::Worker(_))
+            ));
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                pool.workers().is_empty(),
+                "manual pools must not refill themselves"
+            );
+            assert!(matches!(pool.acquire(), Err(PoolError::Busy)));
+            pool.spawn()?;
+            pool.spawn()?;
+            assert!(pool.status().is_full());
+            assert_eq!(pool.exchange(&request(1))?, request(1));
+        }
+        "pool-crash-loop" => {
+            let settings = pool_config(1, PoolMode::Supervised, 2);
+            let pool = Pool::start(binary, sandbox(root), config(), settings, pool_fatal)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                let _ = pool.exchange(&request(253));
+            }
+            panic!("a crash loop must be fatal");
+        }
+        _ => panic!("unknown pool case: {case}"),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 /// Executes one broker lifetime without libtest threads or in-process worker replacement.
 fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let binary = File::open(if case == "bad-executable" {
@@ -79,6 +242,9 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
     assert_eq!(unrelated_fd, 64);
     // SAFETY: fcntl returned a newly owned descriptor.
     let _unrelated_fd = unsafe { File::from_raw_fd(unrelated_fd) };
+    if case.starts_with("pool-") {
+        return pool_broker(case, &binary, root);
+    }
 
     if case == "nitro-root" {
         // Match the pinned AWS init's bind, move, chroot sequence.
@@ -471,6 +637,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("kill-failure", Some("worker request timed out")),
         ("model-error", Some("worker socket I/O failed")),
         ("bad-executable", Some("worker socket I/O failed")),
+        ("pool-threaded", None),
+        ("pool-supervised", None),
+        ("pool-manual", None),
+        (
+            "pool-crash-loop",
+            Some("3 pooled worker failures within the restart window"),
+        ),
     ] {
         let output = Command::new("timeout")
             .args([
