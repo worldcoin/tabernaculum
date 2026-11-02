@@ -53,39 +53,26 @@ fn sandbox(root: &Path) -> SandboxConfig<'_> {
 }
 
 #[cfg(target_os = "linux")]
-/// Forwarding cases stand in for a debug enclave and log to the supervisor through stderr.
+/// Output cases stand in for a debug enclave; Inherit writes into the supervisor's pipes.
 fn sandbox_for<'a>(case: &str, root: &'a Path) -> SandboxConfig<'a> {
-    if !case.starts_with("forward-") {
-        return sandbox(root);
-    }
-    use std::{
-        io::Write,
-        sync::atomic::{AtomicBool, Ordering},
+    let output = match case {
+        "inherit-output" => WorkerOutput::Inherit(DebugEnclave::assume_for_tests()),
+        "capture-output" => WorkerOutput::Capture(DebugEnclave::assume_for_tests()),
+        _ => return sandbox(root),
     };
-    static STALLED: AtomicBool = AtomicBool::new(false);
-    struct Stderr(bool);
-    impl Write for Stderr {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.0 && !STALLED.swap(true, Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_secs(3));
-            }
-            std::io::stderr().write(bytes)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            std::io::stderr().flush()
-        }
-    }
-    let stall = case == "forward-stalled-subscriber";
-    tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(move || Stderr(stall))
-        .init();
     SandboxConfig {
-        output: WorkerOutput::Forward(DebugEnclave::assume_for_tests()),
+        output,
         ..sandbox(root)
     }
+}
+
+#[cfg(target_os = "linux")]
+/// What request 230 writes, after the startup output every non-null stdio receives.
+fn expected_output() -> (Vec<u8>, Vec<u8>) {
+    let mut stderr = format!("{}\n", "z".repeat(300 * 1024)).into_bytes();
+    stderr.extend_from_slice(b"ERROR worker \x1b[31mred\x1b[0m\n");
+    stderr.extend_from_slice(format!("{}\n", "x".repeat(20_000)).as_bytes());
+    (b"worker stdout line\n".to_vec(), stderr)
 }
 
 #[cfg(target_os = "linux")]
@@ -282,18 +269,30 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
         panic!("provisioned worker crash must terminate the broker");
     }
 
-    if case == "forward-output" {
+    if case == "inherit-output" {
         assert_eq!(worker.exchange(&request(230))?, request(230));
-        // Drop drains the output the killed worker already wrote.
-        drop(worker);
         return Ok(());
     }
 
-    if case == "forward-stalled-subscriber" {
-        // The request deadline fails this exchange if a stalled subscriber blocks the worker.
-        assert_eq!(worker.exchange(&request(231))?, request(231));
-        std::thread::sleep(Duration::from_secs(4));
+    if case == "capture-output" {
+        // Startup output already sits in the enlarged pipe; nothing read it yet.
+        let readers = [worker.take_stdout(), worker.take_stderr()].map(|pipe| {
+            let mut pipe = pipe.expect("captured stream");
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut pipe, &mut bytes).map(|_| bytes)
+            })
+        });
+        assert!(worker.take_stdout().is_none() && worker.take_stderr().is_none());
+        assert_eq!(worker.exchange(&request(230))?, request(230));
+        // Killing the worker closes its write ends, so both readers reach EOF.
         drop(worker);
+        let [stdout, stderr] = readers.map(|reader| reader.join().unwrap().unwrap());
+        assert_eq!(
+            (stdout, stderr),
+            expected_output(),
+            "captured bytes must be unchanged"
+        );
         return Ok(());
     }
 
@@ -446,7 +445,6 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
         "read-hostname" => 219,
         "timeout" | "first-request-timeout" | "kill-failure" => 252,
         "model-error" => 254,
-        "forward-crash" => 232,
         "bad-executable" => 1,
         _ => panic!("unknown broker case: {case}"),
     };
@@ -542,46 +540,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let red = "ERROR tabernaculum::worker: ERROR worker \u{FFFD}[31mred\u{FFFD}[0m";
-    let cut = format!("tabernaculum::worker: {} dependency", "x".repeat(8192));
-    for (case, code, expected) in [
-        (
-            "forward-output",
-            0,
-            &[
-                r#"INFO tabernaculum::worker: worker stdout line dependency="worker""#,
-                r#"stream="stdout" truncated=false"#,
-                red,
-                r#"stream="stderr" truncated=true"#,
-                &cut,
-            ][..],
-        ),
-        (
-            "forward-stalled-subscriber",
-            0,
-            &[
-                "first line stalls the subscriber",
-                "worker output lines dropped: log subscriber too slow",
-            ],
-        ),
-        (
-            "forward-crash",
-            FATAL_EXIT,
-            &["worker last words", "fatal_worker:worker socket I/O failed"],
-        ),
-    ] {
+    // Inherited stdio is the broker's own, so the supervisor receives the exact bytes.
+    let (stdout, stderr) = expected_output();
+    for case in ["inherit-output", "capture-output"] {
         let output = run_broker(case, &root)?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(code), "{case}: {stderr}");
-        // Streams interleave freely, but a fatal exit must wait for the worker's last output.
-        let mut rest = &*stderr;
-        for text in expected {
-            let at = rest
-                .find(text)
-                .unwrap_or_else(|| panic!("{case}: missing {text:?}: {stderr}"));
-            if case == "forward-crash" {
-                rest = &rest[at + text.len()..];
-            }
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{case}: {log}");
+        if case == "inherit-output" {
+            assert_eq!(output.stdout, stdout, "{case}");
+            assert_eq!(output.stderr, stderr, "{case}");
         }
     }
 

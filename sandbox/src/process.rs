@@ -5,24 +5,22 @@ compile_error!("the worker seccomp policy is reviewed for x86_64 Linux only");
 
 use std::{
     fs::File,
-    io,
-    os::{fd::AsRawFd, unix::net::UnixStream},
+    io::{self, Read},
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+        unix::net::UnixStream,
+    },
     sync::Arc,
-    time::Duration,
 };
 
-use crate::{
-    ConnectionConfig, ConnectionError, WorkerOutput,
-    connection::Connection,
-    output::{self, Forwarder},
-};
+use crate::{ConnectionConfig, ConnectionError, WorkerOutput, connection::Connection};
 
 #[path = "jail.rs"]
 mod jail;
 pub use jail::{SandboxConfig, WORKER_UID};
 
-/// Lets a killed worker's last output reach the subscriber before the enclave exits.
-const OUTPUT_DRAIN: Duration = Duration::from_millis(500);
+/// Captured pipes hold this much, so output written before `spawn` returns cannot block startup.
+const CAPTURE_PIPE_BYTES: libc::c_int = 1024 * 1024;
 
 // Upstream's Cargo fallback builds static Minijail but does not declare its libcap dependency.
 #[link(name = "cap")]
@@ -36,15 +34,15 @@ pub struct Worker {
     pid: libc::pid_t,
     /// Enclave-owned exit policy; must not unwind or wait for worker cleanup.
     on_fatal: fn(ConnectionError) -> !,
-    /// Present only when a debug enclave forwards worker stdout/stderr.
-    output: Option<Forwarder>,
+    /// Read ends in [`WorkerOutput::Capture`] mode, until taken.
+    stdout: Option<WorkerPipe>,
+    stderr: Option<WorkerPipe>,
 }
 
 impl Worker {
     /// Launches an open executable with FD 3 inside the embedded sandbox and returns it with
     /// its undecoded readiness frame. Call from a single-threaded bootstrap before generating
     /// keys. `on_fatal` must exit the enclave process immediately, not panic or stop a task.
-    /// Forwarded output starts reader threads after the fork.
     ///
     /// # Errors
     /// Returns an error if the sandbox, configuration or launch is invalid, or the worker
@@ -58,14 +56,19 @@ impl Worker {
         config.validate()?;
         let (rpc, child) = UnixStream::pair()?;
         let pipes = match &sandbox.output {
-            WorkerOutput::Discard => None,
-            WorkerOutput::Forward(_) => Some([output::pipe()?, output::pipe()?]),
+            WorkerOutput::Capture(_) => Some([pipe()?, pipe()?]),
+            WorkerOutput::Discard | WorkerOutput::Inherit(_) => None,
         };
 
         let jail = sandbox.create_jail()?;
+        // Minijail points stdio missing from this list at /dev/null.
         let mut fds = vec![(child.as_raw_fd(), 3), (binary.as_raw_fd(), 4)];
-        if let Some([(_, stdout), (_, stderr)]) = &pipes {
-            fds.extend([(stdout.as_raw_fd(), 1), (stderr.as_raw_fd(), 2)]);
+        match (&sandbox.output, &pipes) {
+            (WorkerOutput::Inherit(_), _) => fds.extend([(1, 1), (2, 2)]),
+            (_, Some([(_, stdout), (_, stderr)])) => {
+                fds.extend([(stdout.as_raw_fd(), 1), (stderr.as_raw_fd(), 2)]);
+            }
+            _ => {}
         }
 
         let argv = [c"worker".as_ptr(), c"--bundled".as_ptr(), std::ptr::null()];
@@ -96,18 +99,16 @@ impl Worker {
         drop(jail);
         // Close the parent's duplicate so an initialization failure is observed as EOF.
         drop(child);
-        let output = match pipes {
-            None => None,
+        let (stdout, stderr) = match pipes {
+            None => (None, None),
             Some([(stdout, stdout_writer), (stderr, stderr_writer)]) => {
                 // Readers reach EOF at worker exit only once the parent holds no write end.
                 drop((stdout_writer, stderr_writer));
-                let streams = [("stdout", stdout), ("stderr", stderr)];
-                Some(Forwarder::start(pid, streams).inspect_err(|_| kill(pid))?)
+                (Some(WorkerPipe(stdout)), Some(WorkerPipe(stderr)))
             }
         };
         let (connection, ready) = Connection::open(rpc, config).map_err(|error| {
             kill(pid);
-            drain(output.as_ref());
             WorkerError::Connection(error)
         })?;
 
@@ -116,7 +117,8 @@ impl Worker {
                 connection,
                 pid,
                 on_fatal,
-                output,
+                stdout,
+                stderr,
             },
             ready,
         ))
@@ -133,7 +135,8 @@ impl Worker {
         let result = self.connection.exchange(request);
         if let Some(error) = self.connection.failure().cloned() {
             tracing::error!(dependency = "worker", pid = self.pid, %error, "worker exchange failed");
-            self.terminate(error);
+            kill(self.pid);
+            (self.on_fatal)(error);
         }
 
         result
@@ -147,7 +150,18 @@ impl Worker {
             "worker response rejected"
         );
         self.connection.close(ConnectionError::Protocol);
-        self.terminate(ConnectionError::Protocol)
+        kill(self.pid);
+        (self.on_fatal)(ConnectionError::Protocol)
+    }
+
+    /// The worker's stdout in [`WorkerOutput::Capture`] mode, once, like `Child::stdout.take()`.
+    pub fn take_stdout(&mut self) -> Option<WorkerPipe> {
+        self.stdout.take()
+    }
+
+    /// The worker's stderr in [`WorkerOutput::Capture`] mode, once.
+    pub fn take_stderr(&mut self) -> Option<WorkerPipe> {
+        self.stderr.take()
     }
 
     /// Detects idle exits without reaping, signalling a healthy worker, or sending IPC.
@@ -173,14 +187,9 @@ impl Worker {
 
         if let Some(error) = error {
             tracing::error!(dependency = "worker", pid = self.pid, %error, "worker liveness check failed");
-            self.terminate(ConnectionError::Transport(Arc::new(error)));
+            kill(self.pid);
+            (self.on_fatal)(ConnectionError::Transport(Arc::new(error)));
         }
-    }
-
-    fn terminate(&self, error: ConnectionError) -> ! {
-        kill(self.pid);
-        drain(self.output.as_ref());
-        (self.on_fatal)(error)
     }
 }
 
@@ -194,10 +203,52 @@ pub fn check_alive_if_idle(worker: &std::sync::Mutex<Worker>) {
     }
 }
 
-fn drain(output: Option<&Forwarder>) {
-    if let Some(output) = output {
-        output.drain(OUTPUT_DRAIN);
+/// The read end of a captured worker stream; reaches EOF once the worker exits.
+#[derive(Debug)]
+pub struct WorkerPipe(File);
+
+impl Read for WorkerPipe {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
     }
+}
+
+impl AsFd for WorkerPipe {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl AsRawFd for WorkerPipe {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl From<WorkerPipe> for OwnedFd {
+    fn from(pipe: WorkerPipe) -> Self {
+        pipe.0.into()
+    }
+}
+
+/// Returns a close-on-exec `(read, write)` pipe, enlarged where the kernel allows.
+fn pipe() -> io::Result<(File, File)> {
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 writes two descriptors into this owned array on success.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: Both descriptors are new and owned only here.
+    let (read, write) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    // SAFETY: F_SETPIPE_SZ only resizes this owned pipe's buffer.
+    if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETPIPE_SZ, CAPTURE_PIPE_BYTES) } < 0 {
+        tracing::warn!(
+            dependency = "worker",
+            error = %io::Error::last_os_error(),
+            "captured worker output keeps the default pipe capacity"
+        );
+    }
+    Ok((read, write))
 }
 
 /// Requests namespace termination without waiting; guest teardown owns final cleanup.
@@ -213,10 +264,9 @@ fn kill(pid: libc::pid_t) {
 }
 
 impl Drop for Worker {
-    /// Requests termination on normal shutdown or unwinding, without reaping, then drains output.
+    /// Requests termination on normal shutdown or unwinding, without reaping.
     fn drop(&mut self) {
         kill(self.pid);
-        drain(self.output.as_ref());
     }
 }
 

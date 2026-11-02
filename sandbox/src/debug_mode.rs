@@ -48,33 +48,17 @@ impl DebugEnclave {
     }
 }
 
-/// Where the worker's stdout and stderr go.
+/// Where the worker's stdout and stderr go, like [`std::process::Stdio`].
 #[derive(Debug, Default)]
 pub enum WorkerOutput {
     /// `/dev/null`; the only choice for a measured enclave.
     #[default]
     Discard,
-    /// Each line becomes a `tabernaculum::worker` tracing event in the enclave.
-    Forward(DebugEnclave),
-}
-
-impl WorkerOutput {
-    /// Forwards in a debug enclave and discards otherwise, so one image serves both modes.
-    ///
-    /// # Errors
-    /// Returns an error when debug mode cannot be determined.
-    pub fn forward_if_debug() -> Result<Self, DebugEnclaveError> {
-        Ok(match DebugEnclave::detect()? {
-            Some(enclave) => Self::Forward(enclave),
-            None => {
-                tracing::warn!(
-                    dependency = "worker",
-                    "worker output forwarding needs a debug enclave; discarding output"
-                );
-                Self::Discard
-            }
-        })
-    }
+    /// The enclave's own stdout and stderr; worker bytes reach them unchanged.
+    Inherit(DebugEnclave),
+    /// Pipes whose read ends [`crate::Worker::take_stdout`] and
+    /// [`crate::Worker::take_stderr`] return. An undrained pipe blocks the worker once full.
+    Capture(DebugEnclave),
 }
 
 /// Debug mode could not be determined, so worker output must stay discarded.
@@ -189,7 +173,7 @@ mod tests {
     fn detection_fails_closed_without_an_nsm() {
         if !std::path::Path::new("/dev/nsm").exists() {
             assert!(matches!(
-                WorkerOutput::forward_if_debug(),
+                DebugEnclave::detect(),
                 Err(DebugEnclaveError::Unavailable)
             ));
         }

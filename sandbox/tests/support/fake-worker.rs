@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
         unsafe { stat.assume_init() }
     };
-    // A debug broker forwards stdout and stderr through pipes; stdin is always /dev/null.
+    // A debug broker inherits or captures stdout and stderr as pipes; stdin is always /dev/null.
     let forwarded = stat(1).st_mode & libc::S_IFMT == libc::S_IFIFO;
     for fd in 0..=2 {
         let stat = stat(fd);
@@ -155,6 +155,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(socket.peer_addr()?.is_unnamed());
     // Model initialization happens before the readiness acknowledgment.
     std::thread::sleep(Duration::from_millis(400));
+    if forwarded {
+        // Beyond a default pipe buffer, written before a captured stream can be read.
+        io::stderr().write_all(format!("{}\n", "z".repeat(300 * 1024)).as_bytes())?;
+    }
     let mut socket = socket;
     write_frame(&mut socket, b"ready")?;
     while let Some(request) = read_frame(&mut socket)? {
@@ -327,20 +331,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("worker stdout line");
                     eprintln!("ERROR worker \x1b[31mred\x1b[0m");
                     eprintln!("{}", "x".repeat(20_000));
-                }
-                231 => {
-                    eprintln!("first line stalls the subscriber");
-                    std::thread::sleep(Duration::from_millis(100));
-                    // Far beyond pipe and queue capacity; must not block the response.
-                    let line = format!("{}\n", "y".repeat(1023));
-                    let mut stderr = io::stderr().lock();
-                    for _ in 0..4096 {
-                        stderr.write_all(line.as_bytes())?;
-                    }
-                }
-                232 => {
-                    eprintln!("worker last words");
-                    std::process::exit(3);
                 }
                 250 => return Ok(b"reject".to_vec()),
                 252 => unsafe {

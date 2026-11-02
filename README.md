@@ -62,23 +62,32 @@ binary. Custom images must copy their own provisioner executable and override `E
 ## Debug output
 
 Worker stdout and stderr are `/dev/null` by default. A debug enclave (all PCRs zeroed, checked
-through the NSM) can forward them as `tabernaculum::worker` tracing events instead. A leading
-`ERROR`/`WARN`/`DEBUG`/`TRACE` token sets each line's level; other lines are INFO:
+through the NSM) can choose, like `std::process::Stdio`, to inherit or capture them instead.
+Tabernaculum never interprets the bytes:
 
 ```rust
-let sandbox = SandboxConfig {
-    root,
-    limits: Limits::default(),
-    policy: &POLICY,
-    // Discards, with a warning, in a measured enclave; errors if the NSM is unreadable.
-    output: if forward { WorkerOutput::forward_if_debug()? } else { WorkerOutput::Discard },
+let output = match DebugEnclave::detect()? {
+    // Worker bytes go straight to the enclave's own stdout/stderr, the Nitro console.
+    Some(debug) => WorkerOutput::Inherit(debug),
+    None => WorkerOutput::Discard,
 };
+let (mut worker, ready) = Worker::spawn(&binary, SandboxConfig { output, ..sandbox }, config, failed)?;
 ```
 
-The enclave's subscriber formats and filters these events like its own, so `RUST_LOG` must admit
-`tabernaculum::worker`. Lines are capped at 8 KiB and control characters are replaced. A
-subscriber slower than the worker drops lines and reports the count instead of blocking it. After a
-fatal worker failure, its remaining output is drained for up to 500 ms before `on_fatal` runs.
+With `WorkerOutput::Capture(debug)`, `take_stdout` and `take_stderr` return `Read` handles that
+reach EOF when the worker exits. Consume them like `ChildStdout`, for example as `tracing` events:
+
+```rust
+let stderr = worker.take_stderr().expect("capture mode");
+std::thread::spawn(move || {
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        tracing::info!(target: "worker", "{line}");
+    }
+});
+```
+
+Captured pipes hold 1 MiB, enough for startup output written before `spawn` returns. As with
+`Stdio::piped`, an undrained pipe then blocks the worker, and its requests time out.
 
 On the host, `forward_console` relays a debug enclave's `nitro-cli console` to stdout line by line,
 reattaching with backoff until dropped. The standalone provisioner enables it with
