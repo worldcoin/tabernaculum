@@ -13,11 +13,11 @@ use std::{
     sync::Arc,
 };
 
-use crate::{ConnectionConfig, ConnectionError, WorkerOutput, connection::Connection};
+use crate::{ConnectionConfig, ConnectionError, connection::Connection};
 
 #[path = "jail.rs"]
 mod jail;
-pub use jail::{SandboxConfig, WORKER_UID};
+pub use jail::{SandboxConfig, WORKER_UID, WorkerOutput};
 
 /// `F_SETPIPE_SZ` capacity for [`WorkerOutput::Capture`] pipes. Larger than the usual 64 KiB
 /// default so startup logs cannot fill the pipe and block while `spawn` still waits for
@@ -62,11 +62,11 @@ impl Worker {
         let mut fds = vec![(child.as_raw_fd(), 3), (binary.as_raw_fd(), 4)];
         let pipes = match &sandbox.output {
             WorkerOutput::Discard => None,
-            WorkerOutput::Inherit(_) => {
+            WorkerOutput::Inherit => {
                 fds.extend([(1, 1), (2, 2)]);
                 None
             }
-            WorkerOutput::Capture(_) => {
+            WorkerOutput::Capture => {
                 let pipes = [pipe()?, pipe()?];
                 fds.extend([(pipes[0].1.as_raw_fd(), 1), (pipes[1].1.as_raw_fd(), 2)]);
                 Some(pipes)

@@ -59,22 +59,20 @@ verify the archive, inspect the executable, launch the enclave, sideload the wor
 monitor Nitro state, and clean up on failure or shutdown. These modules remain private to the
 binary. Custom images must copy their own provisioner executable and override `ENTRYPOINT`.
 
-## Debug output
+## Worker output
 
-Worker stdout and stderr are `/dev/null` by default. A debug enclave (all PCRs zeroed, checked
-through the NSM) can choose, like `std::process::Stdio`, to inherit or capture them instead.
-Tabernaculum never interprets the bytes:
+Worker stdout and stderr are `/dev/null` by default. Like `std::process::Stdio`, an enclave can
+inherit or capture them instead; tabernaculum never interprets the bytes. They may contain
+biometric diagnostics, so the enclave decides when exposing them is acceptable, for example only
+when its boot attestation has zeroed PCRs:
 
 ```rust
-let output = match DebugEnclave::detect()? {
-    // Worker bytes go straight to the enclave's own stdout/stderr, the Nitro console.
-    Some(debug) => WorkerOutput::Inherit(debug),
-    None => WorkerOutput::Discard,
-};
+// Worker bytes go straight to the enclave's own stdout/stderr, the Nitro console.
+let output = if debug_enclave { WorkerOutput::Inherit } else { WorkerOutput::Discard };
 let (mut worker, ready) = Worker::spawn(&binary, SandboxConfig { output, ..sandbox }, config, failed)?;
 ```
 
-With `WorkerOutput::Capture(debug)`, `take_stdout` and `take_stderr` return `Read` handles that
+With `WorkerOutput::Capture`, `take_stdout` and `take_stderr` return `Read` handles that
 reach EOF when the worker exits. Consume them like `ChildStdout`, for example as `tracing` events:
 
 ```rust

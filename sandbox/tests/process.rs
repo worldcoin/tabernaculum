@@ -6,8 +6,8 @@ use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, process::Command, 
 
 #[cfg(target_os = "linux")]
 use tabernaculum::{
-    ConnectionConfig, ConnectionError, DebugEnclave, Limits, Policy, SandboxConfig, WORKER_UID,
-    Worker, WorkerError, WorkerOutput,
+    ConnectionConfig, ConnectionError, Limits, Policy, SandboxConfig, WORKER_UID, Worker,
+    WorkerError, WorkerOutput,
 };
 
 #[cfg(target_os = "linux")]
@@ -53,11 +53,11 @@ fn sandbox(root: &Path) -> SandboxConfig<'_> {
 }
 
 #[cfg(target_os = "linux")]
-/// Output cases stand in for a debug enclave; Inherit writes into the supervisor's pipes.
+/// Output cases; Inherit writes into the supervisor's pipes.
 fn sandbox_for<'a>(case: &str, root: &'a Path) -> SandboxConfig<'a> {
     let output = match case {
-        "inherit-output" => WorkerOutput::Inherit(DebugEnclave::assume_for_tests()),
-        "capture-output" => WorkerOutput::Capture(DebugEnclave::assume_for_tests()),
+        "inherit-output" => WorkerOutput::Inherit,
+        "capture-output" => WorkerOutput::Capture,
         _ => return sandbox(root),
     };
     SandboxConfig {

@@ -7,20 +7,16 @@
 #![deny(clippy::all, missing_docs)]
 
 mod connection;
-#[cfg(target_os = "linux")]
-mod debug_mode;
 mod policy;
 #[cfg(target_os = "linux")]
 mod process;
 mod transport;
 
 pub use connection::{ConnectionConfig, ConnectionError};
-#[cfg(target_os = "linux")]
-pub use debug_mode::{DebugEnclave, DebugEnclaveError, WorkerOutput};
 pub use policy::{Policy, PolicyError};
 #[cfg(target_os = "linux")]
 pub use process::{
-    SandboxConfig, WORKER_UID, Worker, WorkerError, WorkerPipe, check_alive_if_idle,
+    SandboxConfig, WORKER_UID, Worker, WorkerError, WorkerOutput, WorkerPipe, check_alive_if_idle,
 };
 /// The worker bundle format and enclave-side bootstrap.
 pub use tabernaculum_bundle as bundle;
