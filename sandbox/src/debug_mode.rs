@@ -36,7 +36,7 @@ impl DebugEnclave {
             Response::Error(code) => return Err(DebugEnclaveError::Nsm(format!("{code:?}"))),
             _ => return Err(DebugEnclaveError::Malformed),
         };
-        Ok(has_zeroed_measurements(&payload(&document)?).then_some(Self(())))
+        Ok(has_zeroed_measurements(&parse_attestation(&document)?).then_some(Self(())))
     }
 
     /// Skips detection for this crate's process tests; absent from release builds.
@@ -75,8 +75,9 @@ pub enum DebugEnclaveError {
     Malformed,
 }
 
-/// Extracts the unverified payload; the local NSM device is trusted, so no signature check.
-fn payload(document: &[u8]) -> Result<AttestationDoc, DebugEnclaveError> {
+/// Parses an unverified attestation document from COSE_Sign1 bytes.
+/// The local NSM device is trusted, so the signature is not checked.
+fn parse_attestation(document: &[u8]) -> Result<AttestationDoc, DebugEnclaveError> {
     let value =
         serde_cbor::from_slice::<Value>(document).map_err(|_| DebugEnclaveError::Malformed)?;
     let value = match value {
@@ -144,14 +145,14 @@ mod tests {
         measured.insert(0, vec![1; 48]);
         for tagged in [false, true] {
             assert!(has_zeroed_measurements(
-                &payload(&cose(zeroed.clone(), tagged)).unwrap()
+                &parse_attestation(&cose(zeroed.clone(), tagged)).unwrap()
             ));
             assert!(!has_zeroed_measurements(
-                &payload(&cose(measured.clone(), tagged)).unwrap()
+                &parse_attestation(&cose(measured.clone(), tagged)).unwrap()
             ));
         }
         assert!(!has_zeroed_measurements(
-            &payload(&cose(BTreeMap::new(), false)).unwrap()
+            &parse_attestation(&cose(BTreeMap::new(), false)).unwrap()
         ));
     }
 
@@ -163,7 +164,7 @@ mod tests {
             serde_cbor::to_vec(&Value::Bytes(vec![1, 2])).unwrap(),
         ] {
             assert!(matches!(
-                payload(&document),
+                parse_attestation(&document),
                 Err(DebugEnclaveError::Malformed)
             ));
         }
