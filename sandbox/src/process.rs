@@ -19,8 +19,10 @@ use crate::{ConnectionConfig, ConnectionError, WorkerOutput, connection::Connect
 mod jail;
 pub use jail::{SandboxConfig, WORKER_UID};
 
-/// Captured pipes hold this much, so output written before `spawn` returns cannot block startup.
-const CAPTURE_PIPE_BYTES: libc::c_int = 1024 * 1024;
+/// `F_SETPIPE_SZ` capacity for [`WorkerOutput::Capture`] pipes. Larger than the usual 64 KiB
+/// default so startup logs cannot fill the pipe and block while `spawn` still waits for
+/// readiness and nobody is draining yet.
+const CAPTURE_PIPE_CAPACITY: libc::c_int = 1024 * 1024;
 
 // Upstream's Cargo fallback builds static Minijail but does not declare its libcap dependency.
 #[link(name = "cap")]
@@ -55,21 +57,21 @@ impl Worker {
     ) -> Result<(Self, Vec<u8>), WorkerError> {
         config.validate()?;
         let (rpc, child) = UnixStream::pair()?;
-        let pipes = match &sandbox.output {
-            WorkerOutput::Capture(_) => Some([pipe()?, pipe()?]),
-            WorkerOutput::Discard | WorkerOutput::Inherit(_) => None,
-        };
-
         let jail = sandbox.create_jail()?;
         // Minijail points stdio missing from this list at /dev/null.
         let mut fds = vec![(child.as_raw_fd(), 3), (binary.as_raw_fd(), 4)];
-        match (&sandbox.output, &pipes) {
-            (WorkerOutput::Inherit(_), _) => fds.extend([(1, 1), (2, 2)]),
-            (_, Some([(_, stdout), (_, stderr)])) => {
-                fds.extend([(stdout.as_raw_fd(), 1), (stderr.as_raw_fd(), 2)]);
+        let pipes = match &sandbox.output {
+            WorkerOutput::Discard => None,
+            WorkerOutput::Inherit(_) => {
+                fds.extend([(1, 1), (2, 2)]);
+                None
             }
-            _ => {}
-        }
+            WorkerOutput::Capture(_) => {
+                let pipes = [pipe()?, pipe()?];
+                fds.extend([(pipes[0].1.as_raw_fd(), 1), (pipes[1].1.as_raw_fd(), 2)]);
+                Some(pipes)
+            }
+        };
 
         let argv = [c"worker".as_ptr(), c"--bundled".as_ptr(), std::ptr::null()];
         let envp = [std::ptr::null::<libc::c_char>()];
@@ -241,7 +243,7 @@ fn pipe() -> io::Result<(File, File)> {
     // SAFETY: Both descriptors are new and owned only here.
     let (read, write) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
     // SAFETY: F_SETPIPE_SZ only resizes this owned pipe's buffer.
-    if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETPIPE_SZ, CAPTURE_PIPE_BYTES) } < 0 {
+    if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETPIPE_SZ, CAPTURE_PIPE_CAPACITY) } < 0 {
         tracing::warn!(
             dependency = "worker",
             error = %io::Error::last_os_error(),
