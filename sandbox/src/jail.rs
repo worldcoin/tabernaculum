@@ -26,6 +26,22 @@ pub struct SandboxConfig<'a> {
     pub limits: Limits,
     /// Seccomp policy, usually [`Policy::default_worker`] with per-entry adjustments.
     pub policy: &'a Policy,
+    /// Worker stdout/stderr. Its bytes may contain biometric diagnostics: anything other than
+    /// [`WorkerOutput::Discard`] belongs only in builds whose output never reaches production logs.
+    pub output: WorkerOutput,
+}
+
+/// Where the worker's stdout and stderr go, like [`std::process::Stdio`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkerOutput {
+    /// `/dev/null`.
+    #[default]
+    Discard,
+    /// The enclave's own stdout and stderr; worker bytes reach them unchanged.
+    Inherit,
+    /// Pipes whose read ends [`crate::Worker::take_stdout`] and [`crate::Worker::take_stderr`]
+    /// return. An undrained pipe blocks the worker once full.
+    Capture,
 }
 
 impl SandboxConfig<'_> {

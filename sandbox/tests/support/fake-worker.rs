@@ -70,12 +70,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::vars_os().next().is_none(),
         "inherited environment"
     );
-    for fd in 0..=2 {
+    let stat = |fd| {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
-        let stat = unsafe { stat.assume_init() };
-        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFCHR);
-        assert_eq!(stat.st_rdev, libc::makedev(1, 3), "stdio must be /dev/null");
+        unsafe { stat.assume_init() }
+    };
+    // A debug broker inherits or captures stdout and stderr as pipes; stdin is always /dev/null.
+    let forwarded = stat(1).st_mode & libc::S_IFMT == libc::S_IFIFO;
+    for fd in 0..=2 {
+        let stat = stat(fd);
+        if forwarded && fd > 0 {
+            assert_eq!(
+                stat.st_mode & libc::S_IFMT,
+                libc::S_IFIFO,
+                "forwarded FD {fd}"
+            );
+        } else {
+            assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFCHR);
+            assert_eq!(stat.st_rdev, libc::makedev(1, 3), "stdio must be /dev/null");
+        }
         for request in [0x5401, 0x802c542a] {
             let mut terminal = [0_u8; 64];
             // SAFETY: both read-only queries receive a buffer larger than termios/termios2.
@@ -142,6 +155,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(socket.peer_addr()?.is_unnamed());
     // Model initialization happens before the readiness acknowledgment.
     std::thread::sleep(Duration::from_millis(400));
+    if forwarded {
+        // Beyond a default pipe buffer, written before a captured stream can be read.
+        io::stderr().write_all(format!("{}\n", "z".repeat(300 * 1024)).as_bytes())?;
+    }
     let mut socket = socket;
     write_frame(&mut socket, b"ready")?;
     while let Some(request) = read_frame(&mut socket)? {
@@ -309,6 +326,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         thread.thread().unpark();
                         thread.join().unwrap();
                     }
+                }
+                230 => {
+                    println!("worker stdout line");
+                    eprintln!("ERROR worker \x1b[31mred\x1b[0m");
+                    eprintln!("{}", "x".repeat(20_000));
                 }
                 250 => return Ok(b"reject".to_vec()),
                 252 => unsafe {

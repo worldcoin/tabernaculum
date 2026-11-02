@@ -7,7 +7,7 @@ use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, process::Command, 
 #[cfg(target_os = "linux")]
 use tabernaculum::{
     ConnectionConfig, ConnectionError, Limits, Policy, SandboxConfig, WORKER_UID, Worker,
-    WorkerError,
+    WorkerError, WorkerOutput,
 };
 
 #[cfg(target_os = "linux")]
@@ -48,7 +48,31 @@ fn sandbox(root: &Path) -> SandboxConfig<'_> {
             max_threads: 8,
         },
         policy: &POLICY,
+        output: WorkerOutput::Discard,
     }
+}
+
+#[cfg(target_os = "linux")]
+/// Output cases; Inherit writes into the supervisor's pipes.
+fn sandbox_for<'a>(case: &str, root: &'a Path) -> SandboxConfig<'a> {
+    let output = match case {
+        "inherit-output" => WorkerOutput::Inherit,
+        "capture-output" => WorkerOutput::Capture,
+        _ => return sandbox(root),
+    };
+    SandboxConfig {
+        output,
+        ..sandbox(root)
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// What request 230 writes, after the startup output every non-null stdio receives.
+fn expected_output() -> (Vec<u8>, Vec<u8>) {
+    let mut stderr = format!("{}\n", "z".repeat(300 * 1024)).into_bytes();
+    stderr.extend_from_slice(b"ERROR worker \x1b[31mred\x1b[0m\n");
+    stderr.extend_from_slice(format!("{}\n", "x".repeat(20_000)).as_bytes());
+    (b"worker stdout line\n".to_vec(), stderr)
 }
 
 #[cfg(target_os = "linux")]
@@ -172,6 +196,7 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
                             max_threads
                         },
                         policy: &POLICY,
+                        output: WorkerOutput::Discard,
                     },
                     config(),
                     fatal
@@ -226,7 +251,8 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
     if case == "startup-timeout" {
         limits.startup_timeout = Duration::from_millis(50);
     }
-    let mut worker = match Worker::spawn(executable, sandbox(runtime_root), limits, fatal) {
+    let mut worker = match Worker::spawn(executable, sandbox_for(case, runtime_root), limits, fatal)
+    {
         Ok((worker, ready)) => {
             assert_eq!(ready, b"ready");
             worker
@@ -241,6 +267,33 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
         assert_eq!(worker.exchange(&request(2))?, request(2));
         worker.exchange(&request(253))?;
         panic!("provisioned worker crash must terminate the broker");
+    }
+
+    if case == "inherit-output" {
+        assert_eq!(worker.exchange(&request(230))?, request(230));
+        return Ok(());
+    }
+
+    if case == "capture-output" {
+        // Startup output already sits in the enlarged pipe; nothing read it yet.
+        let readers = [worker.take_stdout(), worker.take_stderr()].map(|pipe| {
+            let mut pipe = pipe.expect("captured stream");
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut pipe, &mut bytes).map(|_| bytes)
+            })
+        });
+        assert!(worker.take_stdout().is_none() && worker.take_stderr().is_none());
+        assert_eq!(worker.exchange(&request(230))?, request(230));
+        // Killing the worker closes its write ends, so both readers reach EOF.
+        drop(worker);
+        let [stdout, stderr] = readers.map(|reader| reader.join().unwrap().unwrap());
+        assert_eq!(
+            (stdout, stderr),
+            expected_output(),
+            "captured bytes must be unchanged"
+        );
+        return Ok(());
     }
 
     if case == "moved-owner" {
@@ -472,21 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("model-error", Some("worker socket I/O failed")),
         ("bad-executable", Some("worker socket I/O failed")),
     ] {
-        let output = Command::new("timeout")
-            .args([
-                "--kill-after=1s",
-                "10s",
-                "unshare",
-                "--fork",
-                "--pid",
-                "--mount-proc",
-                "--kill-child",
-                "--",
-            ])
-            .arg(std::env::current_exe()?)
-            .arg(case)
-            .arg(&root)
-            .output()?;
+        let output = run_broker(case, &root)?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
@@ -501,9 +540,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Inherited stdio is the broker's own, so the supervisor receives the exact bytes.
+    let (stdout, stderr) = expected_output();
+    for case in ["inherit-output", "capture-output"] {
+        let output = run_broker(case, &root)?;
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{case}: {log}");
+        if case == "inherit-output" {
+            assert_eq!(output.stdout, stdout, "{case}");
+            assert_eq!(output.stderr, stderr, "{case}");
+        }
+    }
+
     std::fs::remove_dir_all(&temp)?;
     println!("Production Minijail confinement, resource limits and broker lifecycle tests passed");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// Runs one broker as PID 1 of its own namespace under a deadline.
+fn run_broker(case: &str, root: &Path) -> std::io::Result<std::process::Output> {
+    Command::new("timeout")
+        .args([
+            "--kill-after=1s",
+            "10s",
+            "unshare",
+            "--fork",
+            "--pid",
+            "--mount-proc",
+            "--kill-child",
+            "--",
+        ])
+        .arg(std::env::current_exe()?)
+        .arg(case)
+        .arg(root)
+        .output()
 }
 
 #[cfg(not(target_os = "linux"))]
