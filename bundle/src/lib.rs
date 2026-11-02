@@ -22,7 +22,6 @@ pub mod enclave;
 /// Host-side bundle preparation and provisioning.
 #[cfg(feature = "host")]
 pub mod host;
-pub mod lines;
 
 /// The only executable entry point accepted by the public broker.
 pub const WORKER_PATH: &str = "bin/worker";

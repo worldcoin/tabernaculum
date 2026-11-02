@@ -89,12 +89,6 @@ std::thread::spawn(move || {
 Captured pipes hold 1 MiB, enough for startup output written before `spawn` returns. As with
 `Stdio::piped`, an undrained pipe then blocks the worker, and its requests time out.
 
-On the host, `forward_console` relays a debug enclave's `nitro-cli console` to stdout line by line,
-reattaching with backoff until dropped. The standalone provisioner enables it with
-`ENCLAVE_CONSOLE_LOGS=true`, which requires `ENCLAVE_DEBUG_MODE=true`. Lines are passed through
-unchanged apart from sanitizing, so an enclave that logs Datadog JSON without ANSI colours is
-parsed by the node agent directly. Output from before the console attached is not replayed.
-
 ## Bootstrap format compatibility
 
 This checkout uses manifest version **4**, containing only `manifest_version`, `sha384` and `size`.

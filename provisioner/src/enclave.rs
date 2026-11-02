@@ -39,8 +39,7 @@ impl<'a> Enclave<'a> {
         }
     }
 
-    /// Returns the launched enclave's ID.
-    pub async fn launch(&self) -> Result<String> {
+    pub async fn launch(&self) -> Result<()> {
         let config = self.config;
         let cpus = config.cpus.to_string();
         let memory = config.memory_mib.to_string();
@@ -69,10 +68,7 @@ impl<'a> Enclave<'a> {
             "unexpected launched CID"
         );
 
-        launch["EnclaveID"]
-            .as_str()
-            .map(str::to_owned)
-            .context("missing launched enclave ID")
+        Ok(())
     }
 
     /// The enclave acknowledges the bundle only once its worker is ready, so a completed
