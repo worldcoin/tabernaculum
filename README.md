@@ -59,6 +59,34 @@ verify the archive, inspect the executable, launch the enclave, sideload the wor
 monitor Nitro state, and clean up on failure or shutdown. These modules remain private to the
 binary. Custom images must copy their own provisioner executable and override `ENTRYPOINT`.
 
+## Worker output
+
+Worker stdout and stderr are `/dev/null` by default. Like `std::process::Stdio`, an enclave can
+inherit or capture them instead; tabernaculum never interprets the bytes. They may contain
+biometric diagnostics, so the enclave decides when exposing them is acceptable, for example only
+when its boot attestation has zeroed PCRs:
+
+```rust
+// Worker bytes go straight to the enclave's own stdout/stderr, the Nitro console.
+let output = if debug_enclave { WorkerOutput::Inherit } else { WorkerOutput::Discard };
+let (mut worker, ready) = Worker::spawn(&binary, SandboxConfig { output, ..sandbox }, config, failed)?;
+```
+
+With `WorkerOutput::Capture`, `take_stdout` and `take_stderr` return `Read` handles that
+reach EOF when the worker exits. Consume them like `ChildStdout`, for example as `tracing` events:
+
+```rust
+let stderr = worker.take_stderr().expect("capture mode");
+std::thread::spawn(move || {
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        tracing::info!(target: "worker", "{line}");
+    }
+});
+```
+
+Captured pipes hold 1 MiB, enough for startup output written before `spawn` returns. As with
+`Stdio::piped`, an undrained pipe then blocks the worker, and its requests time out.
+
 ## Bootstrap format compatibility
 
 This checkout uses manifest version **4**, containing only `manifest_version`, `sha384` and `size`.
