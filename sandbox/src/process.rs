@@ -253,7 +253,7 @@ impl StartingWorker {
     }
 }
 
-/// Kills a worker that never became ready, without reaping.
+/// Kills an unready worker; a separate guard so `StartingWorker` has no `Drop` and `ready` can move its fields.
 struct KillOnDrop(libc::pid_t);
 
 impl KillOnDrop {
