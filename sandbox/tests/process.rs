@@ -69,7 +69,7 @@ fn sandbox_for<'a>(case: &str, root: &'a Path) -> SandboxConfig<'a> {
 #[cfg(target_os = "linux")]
 /// What request 230 writes, after the startup output every non-null stdio receives.
 fn expected_output() -> (Vec<u8>, Vec<u8>) {
-    let mut stderr = format!("{}\n", "z".repeat(300 * 1024)).into_bytes();
+    let mut stderr = format!("{}\n", "z".repeat(2 * 1024 * 1024)).into_bytes();
     stderr.extend_from_slice(b"ERROR worker \x1b[31mred\x1b[0m\n");
     stderr.extend_from_slice(format!("{}\n", "x".repeat(20_000)).as_bytes());
     (b"worker stdout line\n".to_vec(), stderr)
@@ -89,6 +89,75 @@ fn fatal(error: ConnectionError) -> ! {
 }
 
 #[cfg(target_os = "linux")]
+fn children() -> Vec<i32> {
+    let pid = unsafe { libc::getpid() };
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap()
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+/// Captured output is drained between `start` and `ready`, as production callers must.
+fn capture_broker(
+    case: &str,
+    binary: &File,
+    root: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let capture = || sandbox_for("capture-output", root);
+    match case {
+        "capture-output" => {
+            let mut starting = Worker::start(binary, capture(), config(), fatal)?;
+            let readers = [starting.take_stdout(), starting.take_stderr()].map(|pipe| {
+                let mut pipe = pipe.expect("captured stream");
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut pipe, &mut bytes).map(|_| bytes)
+                })
+            });
+            assert!(starting.take_stdout().is_none() && starting.take_stderr().is_none());
+            // The worker writes 2 MiB before readiness; this only returns because it was drained.
+            let (mut worker, ready) = starting.ready()?;
+            assert_eq!(ready, b"ready");
+            assert!(worker.take_stdout().is_none() && worker.take_stderr().is_none());
+            assert_eq!(worker.exchange(&request(230))?, request(230));
+            // Killing the worker closes its write ends, so both readers reach EOF.
+            drop(worker);
+            let [stdout, stderr] = readers.map(|reader| reader.join().unwrap().unwrap());
+            assert_eq!(
+                (stdout, stderr),
+                expected_output(),
+                "captured bytes must be unchanged"
+            );
+        }
+        "capture-requires-start" => {
+            assert!(matches!(
+                Worker::spawn(binary, capture(), config(), fatal),
+                Err(WorkerError::InvalidSandbox(_))
+            ));
+            assert!(
+                children().is_empty(),
+                "spawn must reject capture before forking"
+            );
+        }
+        "capture-abandoned" => {
+            let starting = Worker::start(binary, capture(), config(), fatal)?;
+            let [pid] = children()[..] else {
+                panic!("start must fork exactly one worker");
+            };
+            drop(starting);
+            // Test-only reaping proves the dropped handle requested SIGKILL.
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
+        }
+        _ => panic!("unknown capture case: {case}"),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 /// Executes one broker lifetime without libtest threads or in-process worker replacement.
 fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let binary = File::open(if case == "bad-executable" {
@@ -103,6 +172,9 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
     assert_eq!(unrelated_fd, 64);
     // SAFETY: fcntl returned a newly owned descriptor.
     let _unrelated_fd = unsafe { File::from_raw_fd(unrelated_fd) };
+    if case.starts_with("capture-") {
+        return capture_broker(case, &binary, root);
+    }
 
     if case == "nitro-root" {
         // Match the pinned AWS init's bind, move, chroot sequence.
@@ -271,28 +343,6 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
 
     if case == "inherit-output" {
         assert_eq!(worker.exchange(&request(230))?, request(230));
-        return Ok(());
-    }
-
-    if case == "capture-output" {
-        // Startup output already sits in the enlarged pipe; nothing read it yet.
-        let readers = [worker.take_stdout(), worker.take_stderr()].map(|pipe| {
-            let mut pipe = pipe.expect("captured stream");
-            std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut pipe, &mut bytes).map(|_| bytes)
-            })
-        });
-        assert!(worker.take_stdout().is_none() && worker.take_stderr().is_none());
-        assert_eq!(worker.exchange(&request(230))?, request(230));
-        // Killing the worker closes its write ends, so both readers reach EOF.
-        drop(worker);
-        let [stdout, stderr] = readers.map(|reader| reader.join().unwrap().unwrap());
-        assert_eq!(
-            (stdout, stderr),
-            expected_output(),
-            "captured bytes must be unchanged"
-        );
         return Ok(());
     }
 
@@ -542,7 +592,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Inherited stdio is the broker's own, so the supervisor receives the exact bytes.
     let (stdout, stderr) = expected_output();
-    for case in ["inherit-output", "capture-output"] {
+    for case in [
+        "inherit-output",
+        "capture-output",
+        "capture-requires-start",
+        "capture-abandoned",
+    ] {
         let output = run_broker(case, &root)?;
         let log = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(0), "{case}: {log}");

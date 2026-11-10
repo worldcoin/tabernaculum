@@ -72,20 +72,23 @@ let output = if debug_enclave { WorkerOutput::Inherit } else { WorkerOutput::Dis
 let (mut worker, ready) = Worker::spawn(&binary, SandboxConfig { output, ..sandbox }, config, failed)?;
 ```
 
-With `WorkerOutput::Capture`, `take_stdout` and `take_stderr` return `Read` handles that
-reach EOF when the worker exits. Consume them like `ChildStdout`, for example as `tracing` events:
+`WorkerOutput::Capture` requires `Worker::start`, which forks the worker and returns before the
+readiness wait, so the caller can drain output while the worker initializes. The handles are
+`std::io::PipeReader`s that reach EOF when the worker exits; consume them like `ChildStdout`:
 
 ```rust
-let stderr = worker.take_stderr().expect("capture mode");
+let mut starting = Worker::start(&binary, SandboxConfig { output: WorkerOutput::Capture, ..sandbox }, config, failed)?;
+let stderr = starting.take_stderr().expect("capture mode");
 std::thread::spawn(move || {
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
         tracing::info!(target: "worker", "{line}");
     }
 });
+let (worker, ready) = starting.ready()?;
 ```
 
-Captured pipes hold 1 MiB, enough for startup output written before `spawn` returns. As with
-`Stdio::piped`, an undrained pipe then blocks the worker, and its requests time out.
+As with `Stdio::piped`, an undrained pipe blocks the worker once full, and dropping a reader makes
+the worker's writes fail. `Worker::spawn` rejects `Capture`.
 
 ## Bootstrap format compatibility
 

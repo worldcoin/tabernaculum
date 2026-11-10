@@ -5,11 +5,8 @@ compile_error!("the worker seccomp policy is reviewed for x86_64 Linux only");
 
 use std::{
     fs::File,
-    io::{self, Read},
-    os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
-        unix::net::UnixStream,
-    },
+    io::{self, PipeReader},
+    os::{fd::AsRawFd, unix::net::UnixStream},
     sync::Arc,
 };
 
@@ -18,11 +15,6 @@ use crate::{ConnectionConfig, ConnectionError, connection::Connection};
 #[path = "jail.rs"]
 mod jail;
 pub use jail::{SandboxConfig, WORKER_UID, WorkerOutput};
-
-/// `F_SETPIPE_SZ` capacity for [`WorkerOutput::Capture`] pipes. Larger than the usual 64 KiB
-/// default so startup logs cannot fill the pipe and block while `spawn` still waits for
-/// readiness and nobody is draining yet.
-const CAPTURE_PIPE_CAPACITY: libc::c_int = 1024 * 1024;
 
 // Upstream's Cargo fallback builds static Minijail but does not declare its libcap dependency.
 #[link(name = "cap")]
@@ -37,8 +29,8 @@ pub struct Worker {
     /// Enclave-owned exit policy; must not unwind or wait for worker cleanup.
     on_fatal: fn(ConnectionError) -> !,
     /// Read ends in [`WorkerOutput::Capture`] mode, until taken.
-    stdout: Option<WorkerPipe>,
-    stderr: Option<WorkerPipe>,
+    stdout: Option<PipeReader>,
+    stderr: Option<PipeReader>,
 }
 
 impl Worker {
@@ -48,13 +40,34 @@ impl Worker {
     ///
     /// # Errors
     /// Returns an error if the sandbox, configuration or launch is invalid, or the worker
-    /// never becomes ready.
+    /// never becomes ready. [`WorkerOutput::Capture`] requires [`Worker::start`], so captured
+    /// output can be drained while the worker initializes.
     pub fn spawn(
         binary: &File,
         sandbox: SandboxConfig<'_>,
         config: ConnectionConfig,
         on_fatal: fn(ConnectionError) -> !,
     ) -> Result<(Self, Vec<u8>), WorkerError> {
+        if sandbox.output == WorkerOutput::Capture {
+            return Err(WorkerError::InvalidSandbox(
+                "captured output requires Worker::start",
+            ));
+        }
+        Self::start(binary, sandbox, config, on_fatal)?.ready()
+    }
+
+    /// Launches like [`Worker::spawn`] but returns before the readiness wait. The caller may
+    /// start threads now, for example to drain captured output, then call
+    /// [`StartingWorker::ready`]. Call from a single-threaded bootstrap before generating keys.
+    ///
+    /// # Errors
+    /// Returns an error if the sandbox, configuration or launch is invalid.
+    pub fn start(
+        binary: &File,
+        sandbox: SandboxConfig<'_>,
+        config: ConnectionConfig,
+        on_fatal: fn(ConnectionError) -> !,
+    ) -> Result<StartingWorker, WorkerError> {
         config.validate()?;
         let (rpc, child) = UnixStream::pair()?;
         let jail = sandbox.create_jail()?;
@@ -67,7 +80,7 @@ impl Worker {
                 None
             }
             WorkerOutput::Capture => {
-                let pipes = [pipe()?, pipe()?];
+                let pipes = [io::pipe()?, io::pipe()?];
                 fds.extend([(pipes[0].1.as_raw_fd(), 1), (pipes[1].1.as_raw_fd(), 2)]);
                 Some(pipes)
             }
@@ -106,24 +119,18 @@ impl Worker {
             Some([(stdout, stdout_writer), (stderr, stderr_writer)]) => {
                 // Readers reach EOF at worker exit only once the parent holds no write end.
                 drop((stdout_writer, stderr_writer));
-                (Some(WorkerPipe(stdout)), Some(WorkerPipe(stderr)))
+                (Some(stdout), Some(stderr))
             }
         };
-        let (connection, ready) = Connection::open(rpc, config).map_err(|error| {
-            kill(pid);
-            WorkerError::Connection(error)
-        })?;
 
-        Ok((
-            Self {
-                connection,
-                pid,
-                on_fatal,
-                stdout,
-                stderr,
-            },
-            ready,
-        ))
+        Ok(StartingWorker {
+            worker: KillOnDrop(pid),
+            rpc,
+            config,
+            on_fatal,
+            stdout,
+            stderr,
+        })
     }
 
     /// Sends one request and returns the response undecoded. Returns only recoverable errors;
@@ -156,13 +163,13 @@ impl Worker {
         (self.on_fatal)(ConnectionError::Protocol)
     }
 
-    /// The worker's stdout in [`WorkerOutput::Capture`] mode, once, like `Child::stdout.take()`.
-    pub fn take_stdout(&mut self) -> Option<WorkerPipe> {
+    /// The worker's stdout in [`WorkerOutput::Capture`] mode, if not taken before readiness.
+    pub fn take_stdout(&mut self) -> Option<PipeReader> {
         self.stdout.take()
     }
 
-    /// The worker's stderr in [`WorkerOutput::Capture`] mode, once.
-    pub fn take_stderr(&mut self) -> Option<WorkerPipe> {
+    /// The worker's stderr in [`WorkerOutput::Capture`] mode, if not taken before readiness.
+    pub fn take_stderr(&mut self) -> Option<PipeReader> {
         self.stderr.take()
     }
 
@@ -195,6 +202,75 @@ impl Worker {
     }
 }
 
+/// A forked worker that has not sent its readiness frame. Dropping it kills the worker.
+pub struct StartingWorker {
+    worker: KillOnDrop,
+    rpc: UnixStream,
+    config: ConnectionConfig,
+    on_fatal: fn(ConnectionError) -> !,
+    stdout: Option<PipeReader>,
+    stderr: Option<PipeReader>,
+}
+
+impl StartingWorker {
+    /// The worker's stdout in [`WorkerOutput::Capture`] mode, once, like `Child::stdout.take()`.
+    /// Keep reading it: a full pipe blocks the worker, and a dropped reader fails its writes.
+    pub fn take_stdout(&mut self) -> Option<PipeReader> {
+        self.stdout.take()
+    }
+
+    /// The worker's stderr in [`WorkerOutput::Capture`] mode, once; drain it like stdout.
+    pub fn take_stderr(&mut self) -> Option<PipeReader> {
+        self.stderr.take()
+    }
+
+    /// Waits for the readiness frame and returns the running worker with it undecoded.
+    ///
+    /// # Errors
+    /// Returns an error if the worker never becomes ready; the worker is then killed.
+    pub fn ready(self) -> Result<(Worker, Vec<u8>), WorkerError> {
+        let Self {
+            worker,
+            rpc,
+            config,
+            on_fatal,
+            stdout,
+            stderr,
+        } = self;
+        // On failure `worker` drops here and kills the worker.
+        let (connection, ready) = Connection::open(rpc, config)?;
+        Ok((
+            Worker {
+                connection,
+                // The worker is ready: stop the guard from killing it; `Worker` owns it now.
+                pid: worker.disarm(),
+                on_fatal,
+                stdout,
+                stderr,
+            },
+            ready,
+        ))
+    }
+}
+
+/// Kills an unready worker; a separate guard so `StartingWorker` has no `Drop` and `ready` can move its fields.
+struct KillOnDrop(libc::pid_t);
+
+impl KillOnDrop {
+    /// Hands the worker over without killing it.
+    fn disarm(self) -> libc::pid_t {
+        let pid = self.0;
+        std::mem::forget(self);
+        pid
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        kill(self.0);
+    }
+}
+
 /// Checks liveness unless a request holds the lock; that request's exchange reports a dead
 /// worker itself. A lock poisoned by a panicked request is still checked.
 pub fn check_alive_if_idle(worker: &std::sync::Mutex<Worker>) {
@@ -203,54 +279,6 @@ pub fn check_alive_if_idle(worker: &std::sync::Mutex<Worker>) {
         Err(std::sync::TryLockError::Poisoned(worker)) => worker.into_inner().check_alive(),
         Err(std::sync::TryLockError::WouldBlock) => {}
     }
-}
-
-/// The read end of a captured worker stream; reaches EOF once the worker exits.
-#[derive(Debug)]
-pub struct WorkerPipe(File);
-
-impl Read for WorkerPipe {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl AsFd for WorkerPipe {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
-    }
-}
-
-impl AsRawFd for WorkerPipe {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-}
-
-impl From<WorkerPipe> for OwnedFd {
-    fn from(pipe: WorkerPipe) -> Self {
-        pipe.0.into()
-    }
-}
-
-/// Returns a close-on-exec `(read, write)` pipe, enlarged where the kernel allows.
-fn pipe() -> io::Result<(File, File)> {
-    let mut fds = [0; 2];
-    // SAFETY: pipe2 writes two descriptors into this owned array on success.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: Both descriptors are new and owned only here.
-    let (read, write) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
-    // SAFETY: F_SETPIPE_SZ only resizes this owned pipe's buffer.
-    if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETPIPE_SZ, CAPTURE_PIPE_CAPACITY) } < 0 {
-        tracing::warn!(
-            dependency = "worker",
-            error = %io::Error::last_os_error(),
-            "captured worker output keeps the default pipe capacity"
-        );
-    }
-    Ok((read, write))
 }
 
 /// Requests namespace termination without waiting; guest teardown owns final cleanup.

@@ -39,8 +39,9 @@ pub enum WorkerOutput {
     Discard,
     /// The enclave's own stdout and stderr; worker bytes reach them unchanged.
     Inherit,
-    /// Pipes whose read ends [`crate::Worker::take_stdout`] and [`crate::Worker::take_stderr`]
-    /// return. An undrained pipe blocks the worker once full.
+    /// Pipes read through [`crate::StartingWorker::take_stdout`] and
+    /// [`crate::StartingWorker::take_stderr`]; requires [`crate::Worker::start`]. An undrained
+    /// pipe blocks the worker once full.
     Capture,
 }
 

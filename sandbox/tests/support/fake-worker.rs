@@ -156,8 +156,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Model initialization happens before the readiness acknowledgment.
     std::thread::sleep(Duration::from_millis(400));
     if forwarded {
-        // Beyond a default pipe buffer, written before a captured stream can be read.
-        io::stderr().write_all(format!("{}\n", "z".repeat(300 * 1024)).as_bytes())?;
+        // Far beyond any pipe buffer; only a reader running before readiness lets this finish.
+        io::stderr().write_all(format!("{}\n", "z".repeat(2 * 1024 * 1024)).as_bytes())?;
     }
     let mut socket = socket;
     write_frame(&mut socket, b"ready")?;
