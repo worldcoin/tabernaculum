@@ -242,6 +242,7 @@ impl StartingWorker {
         Ok((
             Worker {
                 connection,
+                // The worker is ready: stop the guard from killing it; `Worker` owns it now.
                 pid: worker.disarm(),
                 on_fatal,
                 stdout,
