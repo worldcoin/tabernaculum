@@ -124,8 +124,8 @@ impl Worker {
         };
 
         Ok(StartingWorker {
-            pid: Some(pid),
-            rpc: Some(rpc),
+            worker: KillOnDrop(pid),
+            rpc,
             config,
             on_fatal,
             stdout,
@@ -204,9 +204,8 @@ impl Worker {
 
 /// A forked worker that has not sent its readiness frame. Dropping it kills the worker.
 pub struct StartingWorker {
-    /// `None` once [`StartingWorker::ready`] handed the worker over.
-    pid: Option<libc::pid_t>,
-    rpc: Option<UnixStream>,
+    worker: KillOnDrop,
+    rpc: UnixStream,
     config: ConnectionConfig,
     on_fatal: fn(ConnectionError) -> !,
     stdout: Option<PipeReader>,
@@ -229,29 +228,45 @@ impl StartingWorker {
     ///
     /// # Errors
     /// Returns an error if the worker never becomes ready; the worker is then killed.
-    pub fn ready(mut self) -> Result<(Worker, Vec<u8>), WorkerError> {
-        let rpc = self.rpc.take().expect("only ready consumes the IPC stream");
-        let (connection, ready) = Connection::open(rpc, self.config.clone())?;
-        let pid = self.pid.take().expect("only ready hands over the worker");
+    pub fn ready(self) -> Result<(Worker, Vec<u8>), WorkerError> {
+        let Self {
+            worker,
+            rpc,
+            config,
+            on_fatal,
+            stdout,
+            stderr,
+        } = self;
+        // On failure `worker` drops here and kills the worker.
+        let (connection, ready) = Connection::open(rpc, config)?;
         Ok((
             Worker {
                 connection,
-                pid,
-                on_fatal: self.on_fatal,
-                stdout: self.stdout.take(),
-                stderr: self.stderr.take(),
+                pid: worker.disarm(),
+                on_fatal,
+                stdout,
+                stderr,
             },
             ready,
         ))
     }
 }
 
-impl Drop for StartingWorker {
-    /// Kills a worker that never became ready, without reaping.
+/// Kills a worker that never became ready, without reaping.
+struct KillOnDrop(libc::pid_t);
+
+impl KillOnDrop {
+    /// Hands the worker over without killing it.
+    fn disarm(self) -> libc::pid_t {
+        let pid = self.0;
+        std::mem::forget(self);
+        pid
+    }
+}
+
+impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        if let Some(pid) = self.pid {
-            kill(pid);
-        }
+        kill(self.0);
     }
 }
 
