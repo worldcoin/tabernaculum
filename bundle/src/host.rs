@@ -115,6 +115,7 @@ impl Bundle {
             manifest_version: 4,
             sha384: hex::encode(digest.finalize()),
             size,
+            application_config: None,
         };
         manifest
             .validate(MAX_BUNDLE_BYTES)
@@ -124,6 +125,17 @@ impl Bundle {
             executable: executable.to_owned(),
             manifest,
         })
+    }
+
+    /// Adds host-selected startup configuration, bounded to the bootstrap format's limit.
+    /// This selects manifest version 5 and requires a receiver that supports it.
+    pub fn with_application_config(mut self, config: serde_json::Value) -> Result<Self, Error> {
+        self.manifest.manifest_version = 5;
+        self.manifest.application_config = Some(config);
+        self.manifest
+            .validate(MAX_BUNDLE_BYTES)
+            .map_err(|_| Error::InvalidBundle)?;
+        Ok(self)
     }
 
     /// Metadata encoded for direct transmission.

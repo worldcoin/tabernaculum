@@ -230,6 +230,44 @@ async fn direct_stream_matches_packaged_bytes_and_existing_receiver() {
 }
 
 #[tokio::test]
+async fn application_configuration_arrives_before_initialization_is_acknowledged() {
+    let (_source, bundle) = fixture(64).await;
+    let config = serde_json::json!({"environment": "stage"});
+    let bundle = bundle.with_application_config(config.clone()).unwrap();
+    let (sender, mut receiver) = tokio::io::duplex(1024);
+    let sending = tokio::spawn(async move { bundle.deliver(sender, DEADLINE).await });
+    let mut bytes = Vec::new();
+    receiver.read_to_end(&mut bytes).await.unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let runtime = crate::receive(
+        &mut std::io::Cursor::new(bytes),
+        MAX_BUNDLE_BYTES,
+        destination.path(),
+    )
+    .unwrap();
+
+    assert_eq!(runtime.application_config, Some(config));
+    assert!(!sending.is_finished());
+    receiver.write_all(&[0]).await.unwrap();
+    receiver.shutdown().await.unwrap();
+    sending.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn invalid_application_configuration_is_rejected_before_transmission() {
+    for config in [
+        serde_json::Value::Null,
+        serde_json::json!("x".repeat(crate::MAX_APPLICATION_CONFIG_BYTES)),
+    ] {
+        let (_source, bundle) = fixture(64).await;
+        assert!(matches!(
+            bundle.with_application_config(config),
+            Err(Error::InvalidBundle)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn initialization_requires_one_zero_byte_and_eof() {
     for acknowledgement in [vec![], vec![1], vec![0, 0]] {
         let (_source, bundle) = fixture(64).await;
