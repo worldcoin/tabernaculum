@@ -62,7 +62,10 @@ async fn run_enclave(
 ) -> Result<()> {
     timeout(config.bootstrap_timeout, async {
         tracing::debug!("fetching sandbox bundle");
-        let bundle = artifact::fetch(config, directory).await?;
+        let mut bundle = artifact::fetch(config, directory).await?;
+        if let Some(application_config) = &config.application_config {
+            bundle = bundle.with_application_config(application_config.clone())?;
+        }
 
         tracing::debug!("launching enclave");
         enclave.launch().await?;

@@ -15,6 +15,7 @@ pub struct Config {
     pub bootstrap_timeout: Duration,
     pub io_timeout: Duration,
     pub poll_interval: Duration,
+    pub application_config: Option<serde_json::Value>,
 }
 
 impl Config {
@@ -57,8 +58,30 @@ impl Config {
             ),
             io_timeout: Duration::from_secs(io_timeout),
             poll_interval: Duration::from_secs(number("POLL_SECONDS", 2)?.into()),
+            application_config: match env::var("ENCLAVE_APPLICATION_CONFIG") {
+                Ok(value) => {
+                    Some(application_config(&value).context("invalid ENCLAVE_APPLICATION_CONFIG")?)
+                }
+                Err(env::VarError::NotPresent) => None,
+                Err(env::VarError::NotUnicode(_)) => {
+                    anyhow::bail!("ENCLAVE_APPLICATION_CONFIG must be UTF-8")
+                }
+            },
         })
     }
+}
+
+fn application_config(value: &str) -> Result<serde_json::Value> {
+    ensure!(
+        value.len() <= tabernaculum_bundle::MAX_APPLICATION_CONFIG_BYTES,
+        "application configuration exceeds 16 KiB"
+    );
+    let config: serde_json::Value = serde_json::from_str(value).context("invalid JSON")?;
+    ensure!(
+        !config.is_null(),
+        "application configuration must not be null"
+    );
+    Ok(config)
 }
 
 pub fn ready_file() -> PathBuf {
@@ -82,4 +105,24 @@ fn number(name: &str, default: u32) -> Result<u32> {
     ensure!(value > 0, "{name} must be positive");
 
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::application_config;
+
+    #[test]
+    fn application_configuration_requires_bounded_non_null_json() {
+        assert_eq!(
+            application_config(r#"{"environment":"stage"}"#).unwrap(),
+            serde_json::json!({"environment": "stage"})
+        );
+        for invalid in ["", "null", "{", "not JSON"] {
+            assert!(application_config(invalid).is_err());
+        }
+        let oversized =
+            serde_json::to_string(&"x".repeat(tabernaculum_bundle::MAX_APPLICATION_CONFIG_BYTES))
+                .unwrap();
+        assert!(application_config(&oversized).is_err());
+    }
 }

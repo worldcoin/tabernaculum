@@ -29,6 +29,8 @@ pub const WORKER_PATH: &str = "bin/worker";
 pub const BOOTSTRAP_PORT: u32 = 1001;
 /// Maximum declared JSON bytes, before parsing or artifact allocation.
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+/// Maximum serialized application configuration accepted during bootstrap.
+pub const MAX_APPLICATION_CONFIG_BYTES: usize = 16 * 1024;
 /// Hard format ceiling; the measured boot configuration must choose its own smaller budget.
 pub const MAX_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -36,12 +38,15 @@ pub const MAX_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    /// Version 4 contains one unsigned executable without deployment labels.
+    /// Version 4 contains one executable; version 5 also carries application configuration.
     pub manifest_version: u32,
     /// Lowercase hex SHA-384 of the entire executable.
     pub sha384: String,
     /// Exact nonzero executable bytes following the declared metadata.
     pub size: u64,
+    /// Host-selected startup configuration, outside enclave measurements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_config: Option<serde_json::Value>,
 }
 
 /// Verified executable and its fixed sandbox root, held for the worker lifetime.
@@ -52,6 +57,8 @@ pub struct VerifiedRuntime {
     pub root: TempDir,
     /// SHA-384 checked against the transferred executable (not a publisher identity).
     pub sha384: String,
+    /// Host-selected startup configuration; the application validates its own schema.
+    pub application_config: Option<serde_json::Value>,
 }
 
 /// Redacted failures; no untrusted paths, manifest text or model bytes are included.
@@ -90,7 +97,14 @@ impl Manifest {
             return Err(Error::InvalidConfig);
         }
 
-        if self.manifest_version != 4
+        let valid_configuration = match (self.manifest_version, &self.application_config) {
+            (4, None) => true,
+            (5, Some(config)) if !config.is_null() => serde_json::to_vec(config)
+                .is_ok_and(|bytes| bytes.len() <= MAX_APPLICATION_CONFIG_BYTES),
+            _ => false,
+        };
+
+        if !valid_configuration
             || self.size == 0
             || self.size > max_bundle_bytes
             || self.sha384.len() != 96
@@ -175,6 +189,7 @@ pub fn receive(
         binary,
         root,
         sha384: manifest.sha384,
+        application_config: manifest.application_config,
     })
 }
 

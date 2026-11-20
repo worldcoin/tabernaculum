@@ -299,6 +299,7 @@ fn broker(case: &str, mut root: &Path) -> Result<(), Box<dyn std::error::Error>>
             manifest_version: 4,
             sha384: hex::encode(Sha384::digest(&bytes)),
             size: bytes.len() as u64,
+            application_config: None,
         })?;
         let mut bundle = Vec::new();
         tabernaculum::bundle::package(&mut bundle, &manifest, &root.join(WORKER_PATH))?;

@@ -92,14 +92,20 @@ the worker's writes fail. `Worker::spawn` rejects `Capture`.
 
 ## Bootstrap format compatibility
 
-This checkout uses manifest version **4**, containing only `manifest_version`, `sha384` and `size`.
-The diagnostic `release_id` has been removed from the wire format, `Manifest`, `VerifiedRuntime`
-and the lower-level `Bundle::prepare` argument list. Preparation now takes only an executable path.
-Executable size limits and SHA-384 transfer integrity checks remain unchanged. Artifact authenticity
-remains the deployment's responsibility; the standalone binary still verifies its archive checksum.
+Without application configuration, the provisioner sends manifest version **4**, containing only
+`manifest_version`, `sha384` and `size`. Existing version 4 receivers remain compatible.
 
-Version 4 is incompatible with version 3 (used by `v0.1.0`): old receivers require `release_id`, and
-new receivers reject both older versions and unknown fields. Update the provisioner image and the
-enclave's Tabernaculum dependency together, rebuild the EIF, and deploy a matching pair. Existing
-tracks can retain their matching older pair. Consumers must remove any use of `runtime.release_id`
-from diagnostics; Flamingo's WIP release manifest and `release_hash` are separate and unchanged.
+Set `ENCLAVE_APPLICATION_CONFIG` to non-null JSON to pass application startup configuration. It is
+limited to 16 KiB and selects manifest version **5**, which adds `application_config`. The enclave
+reads it from `boot.runtime().application_config`, validates its schema and initializes the
+application before acknowledging readiness. The configuration is not written into the worker's
+sandbox or forwarded into its environment.
+
+Application configuration is selected by the parent and is outside enclave measurements. Each
+application decides which fields it trusts the deployment to choose. The standalone provisioner
+reads only this explicit payload; it does not forward the host environment.
+
+Version 5 requires this receiver and a matching provisioner image. Update them together before
+enabling application configuration. Receivers still reject version 3 and unknown fields. Executable
+size limits and SHA-384 transfer checks remain unchanged; artifact authenticity remains the
+deployment's responsibility.

@@ -1,4 +1,4 @@
-# Builds the provisioner base image on every PR and pushes it to ghcr on v* tags.
+# Builds on every PR; publishes v* tags or explicitly requested commit images.
 name: Provisioner image
 
 on:
@@ -7,6 +7,12 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      push:
+        description: Publish the commit image to GHCR
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -40,7 +46,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.push)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -54,7 +60,7 @@ jobs:
           context: .
           file: provisioner/Dockerfile
           platforms: linux/amd64
-          push: ${{ github.ref_type == 'tag' }}
+          push: ${{ github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.push) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -62,7 +68,7 @@ jobs:
 
       # Deploy repos pin this digest.
       - name: Digest
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.push)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: echo "ghcr.io/${GITHUB_REPOSITORY}-provisioner@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"

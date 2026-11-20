@@ -8,7 +8,9 @@ use std::{
 };
 
 use sha2::{Digest, Sha384};
-use tabernaculum_bundle::{Error, MAX_BUNDLE_BYTES, Manifest, WORKER_PATH, package, receive};
+use tabernaculum_bundle::{
+    Error, MAX_APPLICATION_CONFIG_BYTES, MAX_BUNDLE_BYTES, Manifest, WORKER_PATH, package, receive,
+};
 
 /// Small executable for verification tests, never executed.
 struct Fixture {
@@ -30,6 +32,7 @@ impl Fixture {
                 manifest_version: 4,
                 sha384: hex::encode(Sha384::digest(&elf)),
                 size: elf.len() as u64,
+                application_config: None,
             },
             binary: elf,
         }
@@ -53,6 +56,13 @@ fn exact_executable_round_trips() {
     let parent = tempfile::tempdir().unwrap();
     let runtime = receive(&mut Cursor::new(fixture.bundle()), 1024, parent.path()).unwrap();
     assert_eq!(runtime.sha384, fixture.manifest.sha384);
+    assert!(runtime.application_config.is_none());
+    assert!(
+        serde_json::to_value(&fixture.manifest)
+            .unwrap()
+            .get("application_config")
+            .is_none()
+    );
     let path = runtime.root.path().join(WORKER_PATH);
     assert_eq!(fs::read(&path).unwrap(), fixture.binary);
     assert_eq!(
@@ -70,6 +80,60 @@ fn exact_executable_round_trips() {
     assert!(std::io::Write::write_all(&mut read_only, b"overwrite").is_err());
     drop(runtime);
     assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn application_configuration_round_trips_without_entering_the_worker_root() {
+    let mut fixture = Fixture::new();
+    let config = serde_json::json!({"endpoint": "stage", "setting": 17});
+    fixture.manifest.manifest_version = 5;
+    fixture.manifest.application_config = Some(config.clone());
+    let parent = tempfile::tempdir().unwrap();
+    let runtime = receive(&mut Cursor::new(fixture.bundle()), 1024, parent.path()).unwrap();
+
+    assert_eq!(runtime.application_config, Some(config));
+    assert_eq!(fs::read_dir(runtime.root.path()).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(runtime.root.path().join("bin"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn configuration_versions_and_size_are_checked_before_staging() {
+    let parent = tempfile::tempdir().unwrap();
+    for (version, config) in [
+        (4, Some(serde_json::json!({}))),
+        (5, None),
+        (5, Some(serde_json::Value::Null)),
+        (6, Some(serde_json::json!({}))),
+        (
+            5,
+            Some(serde_json::json!("x".repeat(MAX_APPLICATION_CONFIG_BYTES))),
+        ),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.manifest.manifest_version = version;
+        fixture.manifest.application_config = config;
+        let mut reader = Cursor::new(fixture.bundle());
+        let metadata_length = fixture.bundle().len() - fixture.binary.len();
+
+        assert!(matches!(
+            receive(&mut reader, 1024, parent.path()),
+            Err(Error::InvalidManifest)
+        ));
+        assert_eq!(reader.position() as usize, metadata_length);
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    let mut fixture = Fixture::new();
+    fixture.manifest.manifest_version = 5;
+    fixture.manifest.application_config = Some(serde_json::json!(
+        "x".repeat(MAX_APPLICATION_CONFIG_BYTES - 2)
+    ));
+    assert!(fixture.manifest.validate(1024).is_ok());
 }
 
 /// Publishers cannot select filesystem paths or supply the old multi-file format.
