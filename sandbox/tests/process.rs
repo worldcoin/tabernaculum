@@ -6,8 +6,9 @@ use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, process::Command, 
 
 #[cfg(target_os = "linux")]
 use tabernaculum::{
-    ConnectionConfig, ConnectionError, Limits, POOL_UID_BASE, Policy, Pool, PoolConfig, PoolError,
-    PoolMode, RestartPolicy, SandboxConfig, WORKER_UID, Worker, WorkerError, WorkerOutput,
+    ConnectionConfig, ConnectionError, Limits, OneShotPool, POOL_UID_BASE, Policy, Pool,
+    PoolConfig, PoolError, PoolMode, RestartPolicy, SandboxConfig, WORKER_UID, Worker, WorkerError,
+    WorkerOutput,
 };
 
 #[cfg(target_os = "linux")]
@@ -119,6 +120,20 @@ fn wait_for(pool: &Pool, done: impl Fn(&Pool) -> bool) {
         assert!(
             std::time::Instant::now() < deadline,
             "pool state not reached: {:?}",
+            pool.status()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Polls a one-shot pool until its replacement is ready, for up to three seconds.
+fn wait_for_one_shot(pool: &OneShotPool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !pool.status().is_full() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no replacement: {:?}",
             pool.status()
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -306,6 +321,32 @@ fn pool_broker(case: &str, binary: &File, root: &Path) -> Result<(), Box<dyn std
             pool.spawn()?;
             assert!(pool.status().is_full());
             assert_eq!(pool.exchange(&request(1))?, request(1));
+        }
+        "pool-one-shot" => {
+            let settings = pool_config(1, PoolMode::Supervised, 5);
+            let pool = OneShotPool::start(binary, sandbox(root), config(), settings, pool_fatal)?;
+            let [launcher] = children(broker)[..] else {
+                panic!("the broker must only parent the launcher");
+            };
+            // Every request lands on a fresh process, even with one slot.
+            for _ in 0..3 {
+                wait_for_one_shot(&pool);
+                assert_eq!(pool.exchange(&request(236))?, 1_u32.to_le_bytes());
+            }
+            assert!(matches!(
+                pool.exchange_checked(&request(1), |_| false),
+                Err(PoolError::Worker(ConnectionError::Protocol))
+            ));
+            wait_for_one_shot(&pool);
+            assert_eq!(pool.status().recent_failures, 1);
+            // Retired workers were reaped, not left as zombies.
+            assert_eq!(children(launcher).len(), 1);
+            let manual = pool_config(1, PoolMode::Manual, 5);
+            drop(pool);
+            assert!(matches!(
+                OneShotPool::start(binary, sandbox(root), config(), manual, pool_fatal),
+                Err(PoolError::InvalidConfig(_))
+            ));
         }
         "pool-capture" => {
             let settings = pool_config(1, PoolMode::Supervised, 5);
@@ -774,6 +815,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("pool-threaded", None),
         ("pool-supervised", None),
         ("pool-manual", None),
+        ("pool-one-shot", None),
         ("pool-capture", None),
         ("pool-launcher-death", Some("worker launcher failed: ")),
         (

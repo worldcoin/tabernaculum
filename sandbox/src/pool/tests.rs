@@ -244,6 +244,47 @@ fn retired_leases_never_serve_another_request() {
 }
 
 #[test]
+fn one_shot_exchanges_never_reuse_a_worker() {
+    let fake = Arc::new(Fake::default());
+    let pool = start(&fake, config(1, PoolMode::Supervised));
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.push(pool.core.workers()[0]);
+        assert_eq!(pool.core.exchange_once(b"x", |_| true).unwrap(), b"x");
+        eventually(|| pool.core.status().is_full());
+    }
+    seen.dedup();
+    assert_eq!(seen.len(), 3, "a worker served two requests");
+    assert_eq!(fake.reaped.load(Ordering::SeqCst), 3);
+    assert_eq!(pool.core.status().recent_failures, 0);
+}
+
+#[test]
+fn one_shot_failures_and_rejections_retire_the_worker() {
+    let fake = Arc::new(Fake::default());
+    let pool = start(&fake, config(1, PoolMode::Supervised));
+    assert!(matches!(
+        pool.core.exchange_once(CRASH, |_| true),
+        Err(PoolError::Worker(_))
+    ));
+    eventually(|| pool.core.status().is_full());
+    assert!(matches!(
+        pool.core.exchange_once(b"x", |_| false),
+        Err(PoolError::Worker(ConnectionError::Protocol))
+    ));
+    eventually(|| pool.core.status().is_full());
+    assert_eq!(pool.core.status().recent_failures, 2);
+
+    // A request rejected before sending never reached the worker, so it stays.
+    let unused = pool.core.workers()[0];
+    assert!(matches!(
+        pool.core.exchange_once(b"", |_| true),
+        Err(PoolError::Request(_))
+    ));
+    assert_eq!(pool.core.workers(), vec![unused]);
+}
+
+#[test]
 fn replacements_launch_concurrently() {
     struct SlowSpawn(Arc<Fake>);
     impl Backend for SlowSpawn {

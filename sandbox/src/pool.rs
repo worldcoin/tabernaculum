@@ -23,7 +23,7 @@ use crate::ConnectionError;
 #[cfg(target_os = "linux")]
 mod launcher;
 #[cfg(target_os = "linux")]
-pub use launcher::{Lease, Pool};
+pub use launcher::{Lease, OneShotPool, Pool};
 
 /// Largest pool; each slot runs under its own UID.
 pub const MAX_POOL_SIZE: usize = 64;
@@ -470,6 +470,31 @@ impl<B: Backend> Core<B> {
         self.launch(slot).inspect_err(|_| {
             lock(&self.state).slots[slot].state = SlotState::Empty;
         })
+    }
+
+    /// Runs one request on its own worker, then kills that worker whatever the outcome.
+    /// A request rejected before sending leaves the unused worker in the pool.
+    fn exchange_once(
+        &self,
+        request: &[u8],
+        accept: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<Vec<u8>, PoolError> {
+        let mut lease = self.acquire()?;
+        match lease.exchange(request) {
+            Ok(response) if accept(&response) => {
+                lease.retire();
+                Ok(response)
+            }
+            Ok(_) => {
+                lease.fail();
+                Err(PoolError::Worker(ConnectionError::Protocol))
+            }
+            Err(error @ PoolError::Request(_)) => Err(error),
+            Err(error) => {
+                lease.retire();
+                Err(error)
+            }
+        }
     }
 
     fn workers(&self) -> Vec<WorkerId> {

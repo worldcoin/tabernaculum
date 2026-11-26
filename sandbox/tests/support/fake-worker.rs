@@ -335,6 +335,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("{}", "x".repeat(20_000));
                 }
                 233 => return Ok(unsafe { libc::getuid() }.to_le_bytes().to_vec()),
+                // Counts requests this process served, so reuse is visible to the broker.
+                236 => {
+                    static SERVED: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let served = SERVED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    return Ok(served.to_le_bytes().to_vec());
+                }
                 234 => std::thread::sleep(Duration::from_millis(300)),
                 235 => {
                     // Exits after replying, while idle.

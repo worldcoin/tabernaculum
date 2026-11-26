@@ -21,7 +21,7 @@ use std::{
 
 use super::{
     Backend, Endpoint, Handle, Leased, MAX_POOL_SIZE, POOL_UID_BASE, PoolConfig, PoolError,
-    PoolStatus, WorkerId, lock,
+    PoolMode, PoolStatus, WorkerId, lock,
 };
 use crate::{
     ConnectionConfig, ConnectionError, SandboxConfig, WorkerOutput,
@@ -118,6 +118,61 @@ impl Pool {
     #[must_use]
     pub fn status(&self) -> PoolStatus {
         self.handle.core.status()
+    }
+}
+
+/// A supervised pool whose workers each serve exactly one request, then are killed and
+/// replaced, so no request reaches a process that held another request's data.
+pub struct OneShotPool {
+    pool: Pool,
+}
+
+impl OneShotPool {
+    /// Starts like [`Pool::start`]; `config.mode` must be [`PoolMode::Supervised`].
+    ///
+    /// # Errors
+    /// Returns [`PoolError::InvalidConfig`] for a manual pool, or any [`Pool::start`] error.
+    pub fn start(
+        binary: &File,
+        sandbox: SandboxConfig<'_>,
+        connection: ConnectionConfig,
+        config: PoolConfig,
+        on_fatal: fn(PoolError) -> !,
+    ) -> Result<Self, PoolError> {
+        if config.mode != PoolMode::Supervised {
+            return Err(PoolError::InvalidConfig(
+                "one-shot pools must be supervised",
+            ));
+        }
+        Pool::start(binary, sandbox, connection, config, on_fatal).map(|pool| Self { pool })
+    }
+
+    /// Sends one request to a fresh worker, kills it, and returns the response undecoded.
+    ///
+    /// # Errors
+    /// Returns [`PoolError::Busy`] without a free worker, [`PoolError::Request`] for an invalid
+    /// request, or [`PoolError::Worker`] when the worker failed.
+    pub fn exchange(&self, request: &[u8]) -> Result<Vec<u8>, PoolError> {
+        self.exchange_checked(request, |_| true)
+    }
+
+    /// Like [`OneShotPool::exchange`]; a response `accept` rejects counts toward the crash-loop
+    /// limit, so reject only protocol violations. The worker is killed either way.
+    ///
+    /// # Errors
+    /// As [`OneShotPool::exchange`], plus [`PoolError::Worker`] for a rejected response.
+    pub fn exchange_checked(
+        &self,
+        request: &[u8],
+        accept: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<Vec<u8>, PoolError> {
+        self.pool.handle.core.exchange_once(request, accept)
+    }
+
+    /// Slot counts for metrics; replacements keep `starting` above zero under load.
+    #[must_use]
+    pub fn status(&self) -> PoolStatus {
+        self.pool.status()
     }
 }
 

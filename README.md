@@ -57,6 +57,16 @@ let response = lease.exchange(&request)?;
 lease.retire();
 ```
 
+`OneShotPool` makes this the only option: each worker serves exactly one request, then is killed
+and replaced. It exposes no leases, so a used worker can never return to the pool:
+
+```rust
+let pool = OneShotPool::start(&runtime.binary, sandbox, connection, config, pool_failed)?;
+let response = pool.exchange_checked(&request, |response| decodes(response))?;
+```
+
+A rejected response counts as a worker failure. One-shot pools must be supervised.
+
 The health check also ends the enclave through the fatal handler once the launcher exits. Pool
 workers support `WorkerOutput::Discard` and `Inherit`; `Pool::start` rejects `Capture`.
 
