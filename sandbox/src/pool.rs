@@ -22,8 +22,10 @@ use crate::ConnectionError;
 
 #[cfg(target_os = "linux")]
 mod launcher;
+mod output;
 #[cfg(target_os = "linux")]
 pub use launcher::{Lease, OneShotPool, Pool};
+pub use output::{MAX_OUTPUT_LINE_BYTES, OutputLine, OutputStream};
 
 /// Largest pool; each slot runs under its own UID.
 pub const MAX_POOL_SIZE: usize = 64;
@@ -94,6 +96,8 @@ pub struct PoolConfig {
     pub restart: RestartPolicy,
     /// Accepts a worker's readiness frame; a rejected worker counts as a failed launch.
     pub ready: fn(&[u8]) -> bool,
+    /// Lines buffered for the captured-output receiver before new ones are dropped.
+    pub output_capacity: usize,
 }
 
 impl Default for PoolConfig {
@@ -105,6 +109,7 @@ impl Default for PoolConfig {
             health_interval: Duration::from_secs(1),
             restart: RestartPolicy::default(),
             ready: |_| true,
+            output_capacity: 1024,
         }
     }
 }
@@ -121,6 +126,8 @@ impl PoolConfig {
             "restart backoff must be positive and at most its ceiling"
         } else if restart.max_failures == 0 || restart.window.is_zero() {
             "crash-loop limit and window must be positive"
+        } else if self.output_capacity == 0 {
+            "output capacity must be positive"
         } else {
             return Ok(());
         };
@@ -216,8 +223,8 @@ pub(crate) trait Endpoint: Send + 'static {
 /// Starts and reaps workers; the launcher process in production.
 pub(crate) trait Backend: Send + Sync + 'static {
     type Worker: Endpoint;
-    /// Starts the worker for `slot` and returns it with its readiness frame.
-    fn spawn(&self, slot: usize) -> Result<(Self::Worker, Vec<u8>), PoolError>;
+    /// Starts the worker `id` in its slot and returns it with its readiness frame.
+    fn spawn(&self, id: WorkerId) -> Result<(Self::Worker, Vec<u8>), PoolError>;
     /// Terminates and reaps the worker. An error means reaping is no longer possible.
     fn kill(&self, worker: Self::Worker) -> Result<(), PoolError>;
     /// False once workers can no longer be started or reaped.
@@ -313,7 +320,14 @@ impl<B: Backend> Core<B> {
 
     /// Launches into a slot already marked `Starting`.
     fn launch(&self, slot: usize) -> Result<WorkerId, PoolError> {
-        let (worker, ready) = self.backend.spawn(slot)?;
+        // Reserved before spawning so the backend can tag the worker's output.
+        let id = {
+            let mut state = lock(&self.state);
+            let generation = state.next_generation;
+            state.next_generation += 1;
+            WorkerId { slot, generation }
+        };
+        let (worker, ready) = self.backend.spawn(id)?;
         if !(self.config.ready)(&ready) {
             self.reap(worker);
             return Err(PoolError::Launch("rejected readiness frame".into()));
@@ -324,14 +338,12 @@ impl<B: Backend> Core<B> {
             self.reap(worker);
             return Err(PoolError::Launcher("worker pool shut down".into()));
         }
-        let generation = state.next_generation;
-        state.next_generation += 1;
         state.slots[slot] = Slot {
-            generation,
+            generation: id.generation,
             state: SlotState::Idle(worker),
         };
         self.idle.notify_one();
-        Ok(WorkerId { slot, generation })
+        Ok(id)
     }
 
     fn reap(&self, worker: B::Worker) {

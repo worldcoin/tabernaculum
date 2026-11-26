@@ -6,9 +6,9 @@ use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, process::Command, 
 
 #[cfg(target_os = "linux")]
 use tabernaculum::{
-    ConnectionConfig, ConnectionError, Limits, OneShotPool, POOL_UID_BASE, Policy, Pool,
-    PoolConfig, PoolError, PoolMode, RestartPolicy, SandboxConfig, WORKER_UID, Worker, WorkerError,
-    WorkerOutput,
+    ConnectionConfig, ConnectionError, Limits, MAX_OUTPUT_LINE_BYTES, OneShotPool, OutputStream,
+    POOL_UID_BASE, Policy, Pool, PoolConfig, PoolError, PoolMode, RestartPolicy, SandboxConfig,
+    WORKER_UID, Worker, WorkerError, WorkerOutput,
 };
 
 #[cfg(target_os = "linux")]
@@ -109,6 +109,7 @@ fn pool_config(size: usize, mode: PoolMode, max_failures: usize) -> PoolConfig {
             window: Duration::from_secs(60),
         },
         ready: |ready| ready == b"ready",
+        output_capacity: 64,
     }
 }
 
@@ -349,18 +350,51 @@ fn pool_broker(case: &str, binary: &File, root: &Path) -> Result<(), Box<dyn std
             ));
         }
         "pool-capture" => {
-            let settings = pool_config(1, PoolMode::Supervised, 5);
-            assert!(matches!(
-                Pool::start(
-                    binary,
-                    sandbox_for("capture-output", root),
-                    config(),
-                    settings,
-                    pool_fatal
-                ),
-                Err(PoolError::InvalidConfig(_))
-            ));
-            assert!(children(broker).is_empty());
+            let settings = PoolConfig {
+                output_capacity: 4096,
+                ..pool_config(2, PoolMode::Supervised, 5)
+            };
+            let capture = sandbox_for("capture-output", root);
+            let pool = Pool::start(binary, capture, config(), settings, pool_fatal)?;
+            let output = pool.take_output().expect("captured output");
+            assert!(pool.take_output().is_none());
+            let mut lease = pool.acquire()?;
+            let id = lease.id();
+            assert_eq!(lease.exchange(&request(230))?, request(230));
+            drop(lease);
+
+            // Rebuild this worker's streams; full-size lines are chunks of a longer one.
+            let expected = expected_output();
+            let mut streams = (Vec::new(), Vec::new());
+            while streams != expected {
+                let line = output.recv_timeout(Duration::from_secs(3))?;
+                assert!(line.worker.slot < 2, "untagged line: {:?}", line.worker);
+                if line.worker != id {
+                    continue;
+                }
+                let stream = match line.stream {
+                    OutputStream::Stdout => &mut streams.0,
+                    OutputStream::Stderr => &mut streams.1,
+                };
+                stream.extend_from_slice(&line.line);
+                if line.line.len() < MAX_OUTPUT_LINE_BYTES {
+                    stream.push(b'\n');
+                }
+            }
+            assert_eq!(pool.dropped_output_lines(), 0);
+        }
+        "pool-capture-overflow" => {
+            // Nobody reads: startup output overflows the channel instead of blocking workers.
+            let settings = PoolConfig {
+                output_capacity: 1,
+                ..pool_config(1, PoolMode::Supervised, 5)
+            };
+            let capture = sandbox_for("capture-output", root);
+            let pool = OneShotPool::start(binary, capture, config(), settings, pool_fatal)?;
+            assert_eq!(pool.exchange(&request(230))?, request(230));
+            assert!(pool.dropped_output_lines() > 0);
+            let output = pool.take_output().expect("captured output");
+            assert!(output.try_iter().count() <= 1);
         }
         "pool-launcher-death" => {
             let settings = pool_config(1, PoolMode::Supervised, 5);
@@ -817,6 +851,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("pool-manual", None),
         ("pool-one-shot", None),
         ("pool-capture", None),
+        ("pool-capture-overflow", None),
         ("pool-launcher-death", Some("worker launcher failed: ")),
         (
             "pool-crash-loop",

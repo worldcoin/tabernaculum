@@ -70,7 +70,7 @@ impl Endpoint for FakeWorker {
 impl Backend for Arc<Fake> {
     type Worker = FakeWorker;
 
-    fn spawn(&self, _slot: usize) -> Result<(FakeWorker, Vec<u8>), PoolError> {
+    fn spawn(&self, _id: WorkerId) -> Result<(FakeWorker, Vec<u8>), PoolError> {
         if self
             .failing_spawns
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -119,6 +119,7 @@ fn config(size: usize, mode: PoolMode) -> PoolConfig {
             window: Duration::from_secs(60),
         },
         ready: |ready| ready == b"ready",
+        output_capacity: 16,
     }
 }
 
@@ -289,12 +290,12 @@ fn replacements_launch_concurrently() {
     struct SlowSpawn(Arc<Fake>);
     impl Backend for SlowSpawn {
         type Worker = FakeWorker;
-        fn spawn(&self, slot: usize) -> Result<(FakeWorker, Vec<u8>), PoolError> {
+        fn spawn(&self, id: WorkerId) -> Result<(FakeWorker, Vec<u8>), PoolError> {
             let in_flight = self.0.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.0.peak.fetch_max(in_flight, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(50));
             self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
-            self.0.spawn(slot)
+            self.0.spawn(id)
         }
         fn kill(&self, worker: FakeWorker) -> Result<(), PoolError> {
             self.0.kill(worker)
@@ -450,6 +451,10 @@ fn start_fails_cleanly_on_invalid_configuration_or_launch() {
             },
             ..config(1, PoolMode::Manual)
         },
+        PoolConfig {
+            output_capacity: 0,
+            ..config(1, PoolMode::Manual)
+        },
     ] {
         assert!(matches!(
             Handle::start(Arc::clone(&fake), config, unexpected_fatal),
@@ -462,11 +467,11 @@ fn start_fails_cleanly_on_invalid_configuration_or_launch() {
     struct ThirdFails(Arc<Fake>);
     impl Backend for ThirdFails {
         type Worker = FakeWorker;
-        fn spawn(&self, slot: usize) -> Result<(FakeWorker, Vec<u8>), PoolError> {
-            if slot == 2 {
+        fn spawn(&self, id: WorkerId) -> Result<(FakeWorker, Vec<u8>), PoolError> {
+            if id.slot == 2 {
                 return Err(PoolError::Launch("third".into()));
             }
-            self.0.spawn(slot)
+            self.0.spawn(id)
         }
         fn kill(&self, worker: FakeWorker) -> Result<(), PoolError> {
             self.0.kill(worker)
