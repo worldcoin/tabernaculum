@@ -156,7 +156,8 @@ impl OneShotPool {
         self.exchange_checked(request, |_| true)
     }
 
-    /// Like [`OneShotPool::exchange`]; a response `accept` rejects counts as a worker failure.
+    /// Like [`OneShotPool::exchange`]; a response `accept` rejects counts toward the crash-loop
+    /// limit, so reject only protocol violations. The worker is killed either way.
     ///
     /// # Errors
     /// As [`OneShotPool::exchange`], plus [`PoolError::Worker`] for a rejected response.
