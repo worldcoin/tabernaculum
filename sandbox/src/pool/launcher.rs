@@ -148,7 +148,8 @@ impl Lease<'_> {
         self.inner.retire();
     }
 
-    /// Retires the worker after the caller rejects one of its responses.
+    /// Retires the worker after it broke protocol; this counts toward the crash-loop limit.
+    /// To drop a valid response the application merely rejects, use [`Lease::retire`].
     pub fn fail(self) {
         self.inner.fail();
     }
