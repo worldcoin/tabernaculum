@@ -67,8 +67,24 @@ let response = pool.exchange_checked(&request, |response| decodes(response))?;
 
 A rejected response counts as a worker failure. One-shot pools must be supervised.
 
-The health check also ends the enclave through the fatal handler once the launcher exits. Pool
-workers support `WorkerOutput::Discard` and `Inherit`; `Pool::start` rejects `Capture`.
+The health check also ends the enclave through the fatal handler once the launcher exits.
+
+With `WorkerOutput::Capture`, the pool drains every worker's stdout and stderr itself and
+delivers lines tagged with the worker's ID. Like `Worker` capture, this belongs only in builds
+whose output never reaches production logs:
+
+```rust
+let output = pool.take_output().expect("captured output");
+std::thread::spawn(move || {
+    for line in output {
+        eprintln!("{} {:?}: {}", line.worker, line.stream, String::from_utf8_lossy(&line.line));
+    }
+});
+```
+
+The channel holds `output_capacity` lines. A full or dropped receiver loses lines instead of
+blocking workers; `dropped_output_lines()` counts them. Lines longer than
+`MAX_OUTPUT_LINE_BYTES` arrive in chunks of that size.
 
 ## Programmatic provisioning
 

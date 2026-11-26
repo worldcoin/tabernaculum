@@ -3,25 +3,27 @@
 //! The launcher is forked while the enclave is single-threaded and stays single-threaded, so
 //! Minijail can fork from it at any time. It owns every pool worker as their parent: only it
 //! signals and reaps them, so a worker PID is never reused while the pool can still name it.
-//! Requests and replies travel over a `SOCK_SEQPACKET` pair; each spawned worker's IPC socket
-//! is passed back with `SCM_RIGHTS`.
+//! Requests and replies travel over a `SOCK_SEQPACKET` pair; each spawned worker's IPC socket,
+//! and its stdout and stderr read ends when output is captured, are passed back with
+//! `SCM_RIGHTS`.
 
 use std::{
     collections::HashSet,
     fs::File,
-    io,
+    io::{self, PipeReader},
     mem::{self, MaybeUninit},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::net::UnixStream,
     },
-    sync::Mutex,
+    sync::{Mutex, mpsc::Receiver},
     time::Duration,
 };
 
 use super::{
     Backend, Endpoint, Handle, Leased, MAX_POOL_SIZE, POOL_UID_BASE, PoolConfig, PoolError,
     PoolMode, PoolStatus, WorkerId, lock,
+    output::{Drain, OutputLine},
 };
 use crate::{
     ConnectionConfig, ConnectionError, SandboxConfig, WorkerOutput,
@@ -37,6 +39,8 @@ const KILL: u8 = 2;
 const REQUEST_BYTES: usize = 9;
 /// Status, PID (`i32` LE) and an error message of at most 256 bytes.
 const REPLY_BYTES: usize = 5 + 256;
+/// A spawn reply's IPC socket plus captured stdout and stderr.
+const MAX_PASSED_FDS: usize = 3;
 
 /// Sandboxed workers spawned on demand after the enclave has started other threads.
 pub struct Pool {
@@ -48,6 +52,7 @@ impl Pool {
     /// generating keys, like [`crate::Worker::spawn`]; the launcher keeps a copy of this memory.
     /// `sandbox.root` must stay unchanged for the pool's lifetime. `on_fatal` must exit the
     /// enclave immediately; it runs on a crash loop or when the launcher fails.
+    /// With [`WorkerOutput::Capture`], read output through [`Pool::take_output`].
     ///
     /// # Errors
     /// Returns an error for invalid configuration, a multi-threaded caller, or a worker that
@@ -60,15 +65,10 @@ impl Pool {
         on_fatal: fn(PoolError) -> !,
     ) -> Result<Self, PoolError> {
         config.validate()?;
-        if sandbox.output == WorkerOutput::Capture {
-            return Err(PoolError::InvalidConfig(
-                "pool workers cannot capture output",
-            ));
-        }
         connection
             .validate()
             .map_err(|_| PoolError::InvalidConfig("invalid worker connection configuration"))?;
-        let launcher = Launcher::start(binary, &sandbox, connection)?;
+        let launcher = Launcher::start(binary, &sandbox, connection, config.output_capacity)?;
         Ok(Self {
             handle: Handle::start(launcher, config, on_fatal)?,
         })
@@ -118,6 +118,24 @@ impl Pool {
     #[must_use]
     pub fn status(&self) -> PoolStatus {
         self.handle.core.status()
+    }
+
+    /// Captured output of every worker, tagged by worker; `None` without
+    /// [`WorkerOutput::Capture`] or once taken. The bytes may hold biometric diagnostics.
+    /// Lines that arrive while the channel is full, or after the receiver is dropped, are lost.
+    pub fn take_output(&self) -> Option<Receiver<OutputLine>> {
+        self.handle.core.backend.output.as_ref()?.take_receiver()
+    }
+
+    /// Captured lines lost to a full or dropped receiver, for metrics.
+    #[must_use]
+    pub fn dropped_output_lines(&self) -> u64 {
+        self.handle
+            .core
+            .backend
+            .output
+            .as_ref()
+            .map_or(0, Drain::dropped)
     }
 }
 
@@ -174,6 +192,17 @@ impl OneShotPool {
     pub fn status(&self) -> PoolStatus {
         self.pool.status()
     }
+
+    /// As [`Pool::take_output`].
+    pub fn take_output(&self) -> Option<Receiver<OutputLine>> {
+        self.pool.take_output()
+    }
+
+    /// As [`Pool::dropped_output_lines`].
+    #[must_use]
+    pub fn dropped_output_lines(&self) -> u64 {
+        self.pool.dropped_output_lines()
+    }
 }
 
 /// Exclusive use of one pooled worker; dropping it returns the worker to the pool.
@@ -216,6 +245,8 @@ pub(crate) struct Launcher {
     control: Mutex<Option<OwnedFd>>,
     pid: libc::pid_t,
     connection: ConnectionConfig,
+    /// Present with captured output; started after the fork, since it is a thread.
+    output: Option<Drain>,
 }
 
 impl Launcher {
@@ -223,6 +254,7 @@ impl Launcher {
         binary: &File,
         sandbox: &SandboxConfig<'_>,
         connection: ConnectionConfig,
+        output_capacity: usize,
     ) -> Result<Self, PoolError> {
         let tasks = std::fs::read_dir("/proc/self/task")
             .map_err(|error| PoolError::Launcher(format!("cannot count threads: {error}")))?
@@ -243,13 +275,17 @@ impl Launcher {
             serve(&child, binary, sandbox, parent_pid);
         }
         drop(child);
-        let launcher = Self {
+        let mut launcher = Self {
             control: Mutex::new(Some(parent)),
             pid,
             connection,
+            output: None,
         };
         if let Some(control) = lock(&launcher.control).as_ref() {
             set_timeouts(control.as_raw_fd(), CONTROL_TIMEOUT).map_err(launcher_error)?;
+        }
+        if sandbox.output == WorkerOutput::Capture {
+            launcher.output = Some(Drain::start(output_capacity).map_err(launcher_error)?);
         }
         Ok(launcher)
     }
@@ -259,7 +295,7 @@ impl Launcher {
         op: u8,
         slot: u32,
         pid: libc::pid_t,
-    ) -> Result<(libc::pid_t, Option<OwnedFd>), PoolError> {
+    ) -> Result<(libc::pid_t, Vec<OwnedFd>), PoolError> {
         let mut control = lock(&self.control);
         let fd = control
             .as_ref()
@@ -270,7 +306,7 @@ impl Launcher {
         request[1..5].copy_from_slice(&slot.to_le_bytes());
         request[5..9].copy_from_slice(&pid.to_le_bytes());
         let mut reply = [0; REPLY_BYTES];
-        let result = send_message(fd, &request, None).and_then(|()| recv_message(fd, &mut reply));
+        let result = send_message(fd, &request, &[]).and_then(|()| recv_message(fd, &mut reply));
         let (length, passed) = match result {
             Ok((length, passed)) if length >= 5 => (length, passed),
             Ok(_) => {
@@ -298,17 +334,35 @@ impl Launcher {
 impl Backend for Launcher {
     type Worker = PooledWorker;
 
-    fn spawn(&self, slot: usize) -> Result<(PooledWorker, Vec<u8>), PoolError> {
+    fn spawn(&self, id: WorkerId) -> Result<(PooledWorker, Vec<u8>), PoolError> {
         let slot =
-            u32::try_from(slot).map_err(|_| PoolError::InvalidConfig("slot out of range"))?;
-        let (pid, socket) = self.request(SPAWN, slot, 0)?;
-        let Some(socket) = socket else {
-            self.request(KILL, 0, pid)?;
-            return Err(PoolError::Launcher(
-                "spawn reply without a worker socket".into(),
-            ));
+            u32::try_from(id.slot).map_err(|_| PoolError::InvalidConfig("slot out of range"))?;
+        let (pid, passed) = self.request(SPAWN, slot, 0)?;
+        let expected = if self.output.is_some() {
+            MAX_PASSED_FDS
+        } else {
+            1
         };
-        match Connection::open(UnixStream::from(socket), self.connection.clone()) {
+        if passed.len() != expected {
+            self.request(KILL, 0, pid)?;
+            return Err(PoolError::Launcher(format!(
+                "spawn reply passed {} descriptors, expected {expected}",
+                passed.len()
+            )));
+        }
+        let mut passed = passed.into_iter();
+        let socket = UnixStream::from(passed.next().expect("length checked"));
+        if let Some(output) = &self.output {
+            let stdout = PipeReader::from(passed.next().expect("length checked"));
+            let stderr = PipeReader::from(passed.next().expect("length checked"));
+            if let Err(error) = output.add(id, stdout, stderr) {
+                self.request(KILL, 0, pid)?;
+                return Err(PoolError::Launch(format!(
+                    "cannot drain worker output: {error}"
+                )));
+            }
+        }
+        match Connection::open(socket, self.connection.clone()) {
             Ok((connection, ready)) => Ok((PooledWorker { pid, connection }, ready)),
             Err(error) => {
                 self.request(KILL, 0, pid)?;
@@ -414,21 +468,28 @@ fn serve(control: &OwnedFd, binary: &File, sandbox: &SandboxConfig<'_>, parent: 
         let pid = libc::pid_t::from_le_bytes(request[5..9].try_into().expect("four bytes"));
         let sent = match (length, request[0]) {
             (REQUEST_BYTES, SPAWN) if (slot as usize) < MAX_POOL_SIZE => {
-                // Pool::start rejects captured output, so no pipe ends are dropped here.
                 match launch(binary, sandbox, POOL_UID_BASE + slot) {
-                    Ok(Launched { pid, rpc, .. }) => {
+                    Ok(Launched {
+                        pid,
+                        rpc,
+                        stdout,
+                        stderr,
+                    }) => {
                         live.insert(pid);
-                        send_message(fd, &reply(0, pid, ""), Some(rpc.as_raw_fd()))
+                        let mut pass = vec![rpc.as_raw_fd()];
+                        pass.extend(stdout.iter().chain(&stderr).map(AsRawFd::as_raw_fd));
+                        // The launcher's copies close here; the enclave now holds the only ones.
+                        send_message(fd, &reply(0, pid, ""), &pass)
                     }
-                    Err(error) => send_message(fd, &reply(1, 0, &error.to_string()), None),
+                    Err(error) => send_message(fd, &reply(1, 0, &error.to_string()), &[]),
                 }
             }
             (REQUEST_BYTES, KILL) if live.remove(&pid) => {
                 kill_and_reap(pid);
-                send_message(fd, &reply(0, pid, ""), None)
+                send_message(fd, &reply(0, pid, ""), &[])
             }
-            (REQUEST_BYTES, KILL) => send_message(fd, &reply(1, pid, "unknown worker"), None),
-            _ => send_message(fd, &reply(1, 0, "malformed launcher request"), None),
+            (REQUEST_BYTES, KILL) => send_message(fd, &reply(1, pid, "unknown worker"), &[]),
+            _ => send_message(fd, &reply(1, 0, "malformed launcher request"), &[]),
         };
         if sent.is_err() {
             break;
@@ -525,11 +586,11 @@ fn set_timeouts(fd: RawFd, timeout: Duration) -> io::Result<()> {
     Ok(())
 }
 
-/// Ancillary space for exactly one descriptor, aligned for `cmsghdr`.
+/// Ancillary space for up to [`MAX_PASSED_FDS`] descriptors, aligned for `cmsghdr`.
 #[repr(C, align(8))]
 struct Control([u8; 32]);
 
-fn send_message(fd: RawFd, bytes: &[u8], pass: Option<RawFd>) -> io::Result<()> {
+fn send_message(fd: RawFd, bytes: &[u8], pass: &[RawFd]) -> io::Result<()> {
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: bytes.len(),
@@ -539,21 +600,29 @@ fn send_message(fd: RawFd, bytes: &[u8], pass: Option<RawFd>) -> io::Result<()> 
     let mut message: libc::msghdr = unsafe { mem::zeroed() };
     message.msg_iov = &raw mut iov;
     message.msg_iovlen = 1;
-    if let Some(pass) = pass {
-        // SAFETY: The control buffer holds CMSG_SPACE(4) bytes, and CMSG_FIRSTHDR returns its
-        // aligned start; the descriptor is written unaligned into CMSG_DATA.
+    if !pass.is_empty() {
+        let fd_bytes = u32::try_from(mem::size_of_val(pass)).unwrap_or(u32::MAX);
+        // SAFETY: CMSG_SPACE only computes a size.
+        let space = unsafe { libc::CMSG_SPACE(fd_bytes) } as usize;
+        if pass.len() > MAX_PASSED_FDS || space > control.0.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many descriptors for one launcher message",
+            ));
+        }
+        // SAFETY: The control buffer holds `space` bytes, and CMSG_FIRSTHDR returns its
+        // aligned start; the descriptors are written unaligned into CMSG_DATA.
         unsafe {
-            let space = libc::CMSG_SPACE(mem::size_of::<RawFd>() as u32) as usize;
-            debug_assert!(space <= control.0.len());
             message.msg_control = control.0.as_mut_ptr().cast();
             message.msg_controllen = space as _;
             let header = libc::CMSG_FIRSTHDR(&raw const message);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(mem::size_of::<RawFd>() as u32) as _;
-            libc::CMSG_DATA(header)
-                .cast::<RawFd>()
-                .write_unaligned(pass);
+            (*header).cmsg_len = libc::CMSG_LEN(fd_bytes) as _;
+            let data = libc::CMSG_DATA(header).cast::<RawFd>();
+            for (index, &passed) in pass.iter().enumerate() {
+                data.add(index).write_unaligned(passed);
+            }
         }
     }
     loop {
@@ -568,8 +637,9 @@ fn send_message(fd: RawFd, bytes: &[u8], pass: Option<RawFd>) -> io::Result<()> 
     }
 }
 
-/// Receives one message and at most one descriptor; extra or truncated data is an error.
-fn recv_message(fd: RawFd, buffer: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
+/// Receives one message and at most [`MAX_PASSED_FDS`] descriptors; extra or truncated data
+/// is an error.
+fn recv_message(fd: RawFd, buffer: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
     let mut iov = libc::iovec {
         iov_base: buffer.as_mut_ptr().cast(),
         iov_len: buffer.len(),
@@ -612,13 +682,15 @@ fn recv_message(fd: RawFd, buffer: &mut [u8]) -> io::Result<(usize, Option<Owned
     if length == 0 {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 || passed.len() > 1 {
+    if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+        || passed.len() > MAX_PASSED_FDS
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unexpected launcher message size",
         ));
     }
-    Ok((length, passed.pop()))
+    Ok((length, passed))
 }
 
 fn launcher_error(error: io::Error) -> PoolError {

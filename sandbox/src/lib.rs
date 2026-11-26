@@ -18,8 +18,8 @@ pub use policy::{Policy, PolicyError};
 #[cfg(target_os = "linux")]
 pub use pool::{Lease, OneShotPool, Pool};
 pub use pool::{
-    MAX_POOL_SIZE, POOL_UID_BASE, PoolConfig, PoolError, PoolMode, PoolStatus, RestartPolicy,
-    WorkerId,
+    MAX_OUTPUT_LINE_BYTES, MAX_POOL_SIZE, OutputLine, OutputStream, POOL_UID_BASE, PoolConfig,
+    PoolError, PoolMode, PoolStatus, RestartPolicy, WorkerId,
 };
 #[cfg(target_os = "linux")]
 pub use process::{
